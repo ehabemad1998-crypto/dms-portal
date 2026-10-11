@@ -856,18 +856,147 @@ def build_file_block(name, data):
     }, None
 
 
-def analyze_file(name, data, instruction):
-    """Send one file to the AI. Returns (ok, text_or_error)."""
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "{model}:generateContent"
+)
+
+GEMINI_DEFAULT_MODEL = "gemini-2.5-flash"
+
+
+def ai_provider():
+    """'gemini' (has a free tier) or 'anthropic', chosen from the Secrets.
+    AI_PROVIDER can force one; otherwise Gemini is used if its key exists."""
+
+    choice = secret("AI_PROVIDER").lower()
+
+    if choice in ("gemini", "anthropic"):
+        return choice
+
+    if secret("GEMINI_API_KEY"):
+        return "gemini"
+
+    if secret("ANTHROPIC_API_KEY"):
+        return "anthropic"
+
+    return ""
+
+
+def ai_provider_label():
+
+    return {
+        "gemini": "Google Gemini",
+        "anthropic": "Anthropic Claude"
+    }.get(ai_provider(), "not set")
+
+
+def ask_gemini(block, instruction):
+    """Send one file block to Google Gemini. Returns (ok, text_or_error)."""
+
+    key = secret("GEMINI_API_KEY")
+
+    if not key:
+        return False, "No GEMINI_API_KEY found in the app Secrets."
+
+    model = secret("GEMINI_MODEL") or GEMINI_DEFAULT_MODEL
+
+    if block["type"] == "text":
+
+        part = {"text": block["text"]}
+
+    else:
+
+        source = block["source"]
+
+        if len(source["data"]) > 19_000_000:
+
+            return False, (
+                "This file is too large for the free AI "
+                "(about 14 MB at most)."
+            )
+
+        part = {
+            "inline_data": {
+                "mime_type": source["media_type"],
+                "data": source["data"]
+            }
+        }
+
+    payload = {
+        "system_instruction": {"parts": [{"text": AI_SYSTEM_PROMPT}]},
+        "contents": [
+            {
+                "role": "user",
+                "parts": [part, {"text": instruction}]
+            }
+        ],
+        "generationConfig": {"maxOutputTokens": 8192}
+    }
+
+    try:
+
+        response = requests.post(
+            GEMINI_URL.format(model=model),
+            headers={
+                "x-goog-api-key": key,
+                "content-type": "application/json"
+            },
+            json=payload,
+            timeout=180
+        )
+
+    except Exception as e:
+
+        return False, f"Could not connect to the AI service: {e}"
+
+    if response.status_code == 429:
+
+        return False, (
+            "The free AI limit was reached (too many requests). "
+            "Wait a few minutes and try again."
+        )
+
+    if response.status_code != 200:
+
+        return False, (
+            f"AI service error {response.status_code}: "
+            f"{response.text[:300]}"
+        )
+
+    data = response.json()
+
+    texts = []
+
+    for candidate in data.get("candidates", []):
+
+        for p in candidate.get("content", {}).get("parts", []):
+
+            if "text" in p:
+                texts.append(p["text"])
+
+        if texts:
+            break
+
+    text = "\n".join(texts).strip()
+
+    if not text:
+
+        reason = data.get("promptFeedback", {}).get("blockReason", "")
+
+        return False, "The AI returned no answer" + (
+            f" ({reason})." if reason else "."
+        )
+
+    return True, text
+
+
+def ask_claude(block, instruction):
+    """Send one file block to Anthropic Claude. Returns (ok, text_or_error)."""
 
     key = secret("ANTHROPIC_API_KEY")
 
     if not key:
         return False, "No ANTHROPIC_API_KEY found in the app Secrets."
-
-    block, error = build_file_block(name, data)
-
-    if error:
-        return False, error
 
     payload = {
         "model": AI_MODEL,
@@ -912,6 +1041,29 @@ def analyze_file(name, data, instruction):
     ).strip()
 
     return True, text or "(AI returned an empty answer.)"
+
+
+def analyze_file(name, data, instruction):
+    """Send one file to the AI. Returns (ok, text_or_error)."""
+
+    provider = ai_provider()
+
+    if not provider:
+
+        return False, (
+            "No AI key found. Add GEMINI_API_KEY (free tier) or "
+            "ANTHROPIC_API_KEY in the app Secrets."
+        )
+
+    block, error = build_file_block(name, data)
+
+    if error:
+        return False, error
+
+    if provider == "gemini":
+        return ask_gemini(block, instruction)
+
+    return ask_claude(block, instruction)
 
 
 # ===== UI =====
@@ -1805,6 +1957,8 @@ elif page == "📊 Reports":
 elif page == "🪄 AI":
 
     st.title("🪄 AI")
+
+    st.caption(f"AI provider: {ai_provider_label()}")
 
     if is_admin:
 
