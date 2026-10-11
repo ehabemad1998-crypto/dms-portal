@@ -335,6 +335,30 @@ def add_project(number, name, client, status):
     return False, f"Could not add the project ({err(r)})"
 
 
+def update_project_status(number, status):
+    """Change a project to Active or Closed."""
+
+    r = api(
+        "PATCH",
+        "/rest/v1/projects",
+        params={"project_number": f"eq.{number}"},
+        json_body={"status": status},
+        headers={"Prefer": "return=representation"}
+    )
+
+    if r.status_code == 200:
+
+        if r.json():
+            return True, f"Project {number} is now {status}."
+
+        return False, "Nothing changed (not allowed, or project not found)."
+
+    if r.status_code in (401, 403):
+        return False, "You are not allowed to change projects."
+
+    return False, f"Could not change the status ({err(r)})"
+
+
 def bulk_add_projects(rows, status):
     """Insert many projects. Existing numbers are skipped."""
 
@@ -988,9 +1012,13 @@ if page == "🏠 Dashboard":
 
     col2.metric("Documents", count_documents())
 
-    col3.metric("Pending", "0")
+    pending_count = len([p for p in projects if p[3] == "Active"])
 
-    col4.metric("Approved", "0")
+    approved_count = len([p for p in projects if p[3] == "Closed"])
+
+    col3.metric("Pending", pending_count, help="Active projects")
+
+    col4.metric("Approved", approved_count, help="Closed projects")
 
     st.divider()
 
@@ -1021,7 +1049,7 @@ elif page == "📁 Projects":
 
     st.write("Manage and track all project information.")
 
-    for key_name in ("import_msg", "delete_msg"):
+    for key_name in ("import_msg", "delete_msg", "status_msg"):
 
         if key_name in st.session_state:
             st.success(st.session_state.pop(key_name))
@@ -1049,7 +1077,17 @@ elif page == "📁 Projects":
 
             with st.container(border=True):
 
-                col1, col2, col3, col4 = st.columns([1.5, 3, 2, 1.5])
+                if is_admin:
+
+                    col1, col2, col3, col4, col5 = st.columns(
+                        [1.3, 3, 2, 1.4, 1.6]
+                    )
+
+                else:
+
+                    col1, col2, col3, col4 = st.columns([1.5, 3, 2, 1.5])
+
+                    col5 = None
 
                 col1.write(f"**{project[0]}**")
 
@@ -1060,6 +1098,45 @@ elif page == "📁 Projects":
                 col4.write(
                     "🟢 Active" if project[3] == "Active" else "🔴 Closed"
                 )
+
+                if col5 is not None:
+
+                    with col5.popover("⚙️ Status"):
+
+                        st.write(f"Project **{project[0]}**: what is it now?")
+
+                        new_status = st.radio(
+                            "Set the project as:",
+                            ["Active", "Closed"],
+                            index=0 if project[3] == "Active" else 1,
+                            format_func=lambda x: (
+                                "🟢 Active (still running)"
+                                if x == "Active"
+                                else "🔴 Closed (finished)"
+                            ),
+                            key=f"status_radio_{project[0]}"
+                        )
+
+                        if st.button(
+                            "💾 Save",
+                            key=f"status_save_{project[0]}",
+                            use_container_width=True
+                        ):
+
+                            ok, message = update_project_status(
+                                project[0],
+                                new_status
+                            )
+
+                            if ok:
+
+                                st.session_state.status_msg = message
+
+                                st.rerun()
+
+                            else:
+
+                                st.error(message)
 
     else:
 
@@ -1549,7 +1626,7 @@ elif page == "📊 Reports":
 
     projects = get_projects()
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
 
     col1.metric("Total Projects", len(projects))
 
@@ -1558,7 +1635,12 @@ elif page == "📊 Reports":
         len([p for p in projects if p[3] == "Active"])
     )
 
-    col3.metric("Total Documents", count_documents())
+    col3.metric(
+        "Closed Projects",
+        len([p for p in projects if p[3] == "Closed"])
+    )
+
+    col4.metric("Total Documents", count_documents())
 
 
 # =========================================================
