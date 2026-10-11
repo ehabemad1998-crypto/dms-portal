@@ -574,6 +574,30 @@ def count_documents():
         return 0
 
 
+def delete_document(doc_id, storage_path):
+    """Delete one file: its record and the stored file."""
+
+    r = api(
+        "DELETE",
+        "/rest/v1/documents",
+        params={"id": f"eq.{doc_id}"},
+        headers={"Prefer": "return=representation"}
+    )
+
+    if r.status_code in (401, 403):
+        return False, "You are not allowed to delete files."
+
+    if r.status_code != 200:
+        return False, f"Could not delete the file ({err(r)})"
+
+    if not r.json():
+        return False, "Nothing was deleted (not allowed, or file not found)."
+
+    delete_storage([storage_path])
+
+    return True, "The file was deleted."
+
+
 def upload_file(project_id, file_name, data, content_type):
     """Store a file in the private bucket. Returns (path, error)."""
 
@@ -1335,6 +1359,15 @@ elif page == "📄 Documents":
 
     st.title("📄 Documents")
 
+    if "doc_msg" in st.session_state:
+
+        doc_ok, doc_text = st.session_state.pop("doc_msg")
+
+        if doc_ok:
+            st.success(doc_text)
+        else:
+            st.error(doc_text)
+
     projects = get_projects()
 
     if not projects:
@@ -1408,6 +1441,42 @@ elif page == "📄 Documents":
             else:
 
                 st.error("Could not create a download link for this file.")
+
+            if is_admin:
+
+                st.divider()
+
+                with st.expander("🗑️ Delete this file"):
+
+                    if "doc_delete_counter" not in st.session_state:
+                        st.session_state.doc_delete_counter = 0
+
+                    dc = st.session_state.doc_delete_counter
+
+                    st.warning(
+                        f"You are about to delete **{doc[2]}** from "
+                        f"project {doc[1]}. This cannot be undone."
+                    )
+
+                    confirm_doc = st.checkbox(
+                        "Yes, delete this file",
+                        key=f"doc_confirm_{dc}_{doc[0]}"
+                    )
+
+                    if st.button(
+                        "🗑️ Delete File",
+                        key=f"doc_delete_btn_{dc}",
+                        disabled=not confirm_doc,
+                        use_container_width=True
+                    ):
+
+                        ok, message = delete_document(doc[0], doc[7])
+
+                        st.session_state.doc_delete_counter += 1
+
+                        st.session_state.doc_msg = (ok, message)
+
+                        st.rerun()
 
         else:
 
