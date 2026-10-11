@@ -212,6 +212,12 @@ def format_size(size):
     return f"{size:.1f} TB"
 
 
+def md_safe(text):
+    """Escape characters that Streamlit would read as formatting."""
+
+    return re.sub(r"([\\`*_\[\]~$:<>#|])", r"\\\1", str(text))
+
+
 def number_key(number):
     """Sort 1, 2, 10 as numbers, then any non-numeric ones as text."""
 
@@ -982,6 +988,86 @@ is_admin = auth["role"] == "admin"
 
 
 # =========================================================
+# DOCUMENTS TABLE WITH DELETE (red X on every row)
+# =========================================================
+
+@st.dialog("Delete file")
+def confirm_delete_dialog(doc_id, file_name, project, storage_path):
+
+    st.write(
+        f"Are you sure you want to delete **{md_safe(file_name)}** "
+        f"(project {md_safe(project)})?"
+    )
+
+    st.caption("This cannot be undone.")
+
+    yes_col, no_col = st.columns(2)
+
+    if yes_col.button(
+        "Yes, delete",
+        type="primary",
+        use_container_width=True
+    ):
+
+        ok, message = delete_document(doc_id, storage_path)
+
+        st.session_state.doc_msg = (ok, message)
+
+        st.rerun()
+
+    if no_col.button("Cancel", use_container_width=True):
+
+        st.rerun()
+
+
+def show_documents_table(documents, can_delete):
+
+    widths = [1, 5, 1, 1.3, 2, 2]
+
+    labels = [
+        "Project", "File Name", "Type", "Size", "Notes", "Uploaded At"
+    ]
+
+    if can_delete:
+
+        widths.append(0.8)
+
+        labels.append("")
+
+    header = st.columns(widths)
+
+    for col, label in zip(header, labels):
+        col.markdown(f"**{label}**")
+
+    line = "<hr style='margin:4px 0;opacity:0.25'>"
+
+    st.markdown(line, unsafe_allow_html=True)
+
+    for d in documents:
+
+        cols = st.columns(widths)
+
+        cols[0].markdown(md_safe(d[1]))
+        cols[1].markdown(md_safe(d[2]))
+        cols[2].markdown(md_safe(d[3]))
+        cols[3].markdown(md_safe(format_size(d[4])))
+        cols[4].markdown(md_safe(d[5]))
+        cols[5].markdown(md_safe(d[6]))
+
+        if can_delete:
+
+            if cols[6].button(
+                "❌",
+                key=f"del_doc_{d[0]}",
+                help="Delete this file"
+            ):
+
+                confirm_delete_dialog(d[0], d[2], d[1], d[7])
+
+        st.markdown(line, unsafe_allow_html=True)
+
+
+# =========================================================
 # SIDEBAR
 # =========================================================
 
@@ -1401,19 +1487,7 @@ elif page == "📄 Documents":
 
         if documents:
 
-            show_table(
-                [
-                    {
-                        "Project": d[1],
-                        "File Name": d[2],
-                        "Type": d[3],
-                        "Size": format_size(d[4]),
-                        "Notes": d[5],
-                        "Uploaded At": d[6]
-                    }
-                    for d in documents
-                ]
-            )
+            show_documents_table(documents, is_admin)
 
             st.divider()
 
@@ -1441,42 +1515,6 @@ elif page == "📄 Documents":
             else:
 
                 st.error("Could not create a download link for this file.")
-
-            if is_admin:
-
-                st.divider()
-
-                with st.expander("🗑️ Delete this file"):
-
-                    if "doc_delete_counter" not in st.session_state:
-                        st.session_state.doc_delete_counter = 0
-
-                    dc = st.session_state.doc_delete_counter
-
-                    st.warning(
-                        f"You are about to delete **{doc[2]}** from "
-                        f"project {doc[1]}. This cannot be undone."
-                    )
-
-                    confirm_doc = st.checkbox(
-                        "Yes, delete this file",
-                        key=f"doc_confirm_{dc}_{doc[0]}"
-                    )
-
-                    if st.button(
-                        "🗑️ Delete File",
-                        key=f"doc_delete_btn_{dc}",
-                        disabled=not confirm_doc,
-                        use_container_width=True
-                    ):
-
-                        ok, message = delete_document(doc[0], doc[7])
-
-                        st.session_state.doc_delete_counter += 1
-
-                        st.session_state.doc_msg = (ok, message)
-
-                        st.rerun()
 
         else:
 
