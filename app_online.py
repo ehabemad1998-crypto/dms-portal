@@ -1020,7 +1020,39 @@ def confirm_delete_dialog(doc_id, file_name, project, storage_path):
         st.rerun()
 
 
+DOCS_CSS = """
+<style>
+.st-key-docs_table p { font-size: 14px; margin-bottom: 0; }
+
+.st-key-docs_table [class*="st-key-del_doc_"] button {
+    min-height: 26px;
+    height: 26px;
+    width: 26px;
+    min-width: 26px;
+    padding: 0;
+    border: none;
+    background: transparent;
+    box-shadow: none;
+    border-radius: 6px;
+    color: #c62828;
+}
+
+.st-key-docs_table [class*="st-key-del_doc_"] button p {
+    font-size: 15px;
+    line-height: 1;
+}
+
+.st-key-docs_table [class*="st-key-del_doc_"] button:hover {
+    background: rgba(198, 40, 40, 0.12);
+    color: #b71c1c;
+}
+</style>
+"""
+
+
 def show_documents_table(documents, can_delete):
+
+    st.markdown(DOCS_CSS, unsafe_allow_html=True)
 
     widths = [1, 5, 1, 1.3, 2, 2]
 
@@ -1030,41 +1062,57 @@ def show_documents_table(documents, can_delete):
 
     if can_delete:
 
-        widths.append(0.8)
+        widths.append(0.6)
 
         labels.append("")
 
-    header = st.columns(widths)
+    head_style = (
+        "font-size:12px;font-weight:600;text-transform:uppercase;"
+        "letter-spacing:0.05em;opacity:0.6"
+    )
 
-    for col, label in zip(header, labels):
-        col.markdown(f"**{label}**")
+    line = "<hr style='margin:2px 0;opacity:0.15'>"
 
-    line = "<hr style='margin:4px 0;opacity:0.25'>"
+    with st.container(key="docs_table"):
 
-    st.markdown(line, unsafe_allow_html=True)
+        header = st.columns(widths, vertical_alignment="center")
 
-    for d in documents:
+        for col, label in zip(header, labels):
 
-        cols = st.columns(widths)
+            if label:
 
-        cols[0].markdown(md_safe(d[1]))
-        cols[1].markdown(md_safe(d[2]))
-        cols[2].markdown(md_safe(d[3]))
-        cols[3].markdown(md_safe(format_size(d[4])))
-        cols[4].markdown(md_safe(d[5]))
-        cols[5].markdown(md_safe(d[6]))
+                col.markdown(
+                    f"<span style='{head_style}'>{label}</span>",
+                    unsafe_allow_html=True
+                )
 
-        if can_delete:
+        st.markdown(
+            "<hr style='margin:4px 0;opacity:0.4'>",
+            unsafe_allow_html=True
+        )
 
-            if cols[6].button(
-                "❌",
-                key=f"del_doc_{d[0]}",
-                help="Delete this file"
-            ):
+        for d in documents:
 
-                confirm_delete_dialog(d[0], d[2], d[1], d[7])
+            cols = st.columns(widths, vertical_alignment="center")
 
-        st.markdown(line, unsafe_allow_html=True)
+            cols[0].markdown(md_safe(d[1]))
+            cols[1].markdown(md_safe(d[2]))
+            cols[2].markdown(md_safe(d[3]))
+            cols[3].markdown(md_safe(format_size(d[4])))
+            cols[4].markdown(md_safe(d[5]))
+            cols[5].markdown(md_safe(d[6]))
+
+            if can_delete:
+
+                if cols[6].button(
+                    "✕",
+                    key=f"del_doc_{d[0]}",
+                    help="Delete this file"
+                ):
+
+                    confirm_delete_dialog(d[0], d[2], d[1], d[7])
+
+            st.markdown(line, unsafe_allow_html=True)
 
 
 # =========================================================
