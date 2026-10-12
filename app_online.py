@@ -861,7 +861,7 @@ GEMINI_URL = (
     "{model}:generateContent"
 )
 
-GEMINI_DEFAULT_MODEL = "gemini-2.5-flash"
+GEMINI_DEFAULT_MODEL = "gemini-3.8-flash"
 
 
 def ai_provider():
