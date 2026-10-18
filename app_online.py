@@ -3,6 +3,7 @@ import requests
 import os
 import re
 import io
+import json
 import uuid
 import time
 import html
@@ -864,30 +865,60 @@ GEMINI_URL = (
 GEMINI_DEFAULT_MODEL = "gemini-3.8-flash"
 
 
-def ai_provider():
-    """'gemini' (has a free tier) or 'anthropic', chosen from the Secrets.
-    AI_PROVIDER can force one; otherwise Gemini is used if its key exists."""
+PROVIDER_LABELS = {
+    "gemini": "Google Gemini",
+    "openrouter": "OpenRouter (free models)",
+    "anthropic": "Anthropic Claude"
+}
 
-    choice = secret("AI_PROVIDER").lower()
+PROVIDER_KEYS = {
+    "gemini": "GEMINI_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY"
+}
 
-    if choice in ("gemini", "anthropic"):
-        return choice
 
-    if secret("GEMINI_API_KEY"):
-        return "gemini"
+def ai_providers():
+    """Providers that have a key in Secrets, in the order they are tried.
+    AI_PROVIDER (optional) puts one of them first."""
 
-    if secret("ANTHROPIC_API_KEY"):
-        return "anthropic"
+    order = ["gemini", "openrouter", "anthropic"]
 
-    return ""
+    preferred = secret("AI_PROVIDER").lower()
+
+    if preferred in order:
+
+        order.remove(preferred)
+
+        order.insert(0, preferred)
+
+    return [p for p in order if secret(PROVIDER_KEYS[p])]
 
 
 def ai_provider_label():
 
-    return {
-        "gemini": "Google Gemini",
-        "anthropic": "Anthropic Claude"
-    }.get(ai_provider(), "not set")
+    names = [PROVIDER_LABELS[p] for p in ai_providers()]
+
+    return ", ".join(names) if names else "not set"
+
+
+def ai_provider_choices():
+    """Choices for the 'Which AI?' list: label -> code."""
+
+    available = ai_providers()
+
+    choices = {}
+
+    if len(available) > 1:
+        choices["Auto (try each AI until one works)"] = "auto"
+
+    for p in available:
+        choices[PROVIDER_LABELS[p]] = p
+
+    if len(available) > 1:
+        choices["Compare all (see every answer)"] = "compare"
+
+    return choices
 
 
 def ask_gemini(block, instruction):
@@ -1043,27 +1074,1173 @@ def ask_claude(block, instruction):
     return True, text or "(AI returned an empty answer.)"
 
 
-def analyze_file(name, data, instruction):
-    """Send one file to the AI. Returns (ok, text_or_error)."""
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-    provider = ai_provider()
+OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 
-    if not provider:
 
-        return False, (
-            "No AI key found. Add GEMINI_API_KEY (free tier) or "
-            "ANTHROPIC_API_KEY in the app Secrets."
+def openrouter_model():
+    """The OpenRouter model to use: OPENROUTER_MODEL from Secrets, or else
+    the free text model with the biggest context window."""
+
+    chosen = secret("OPENROUTER_MODEL")
+
+    if chosen:
+        return chosen
+
+    cached = st.session_state.get("openrouter_auto_model")
+
+    if cached:
+        return cached
+
+    try:
+
+        models = requests.get(OPENROUTER_MODELS_URL, timeout=30).json()
+
+        models = models.get("data", [])
+
+    except Exception:
+
+        return ""
+
+    free = []
+
+    for m in models:
+
+        pricing = m.get("pricing", {}) or {}
+
+        outputs = (m.get("architecture", {}) or {}).get(
+            "output_modalities"
+        ) or ["text"]
+
+        if (
+            str(pricing.get("prompt")) in ("0", "0.0")
+            and str(pricing.get("completion")) in ("0", "0.0")
+            and "text" in outputs
+        ):
+            free.append(m)
+
+    free.sort(key=lambda m: m.get("context_length") or 0, reverse=True)
+
+    if not free:
+        return ""
+
+    st.session_state.openrouter_auto_model = free[0]["id"]
+
+    return free[0]["id"]
+
+
+def _openrouter_text(prompt, system):
+    """Plain text request to OpenRouter. Returns (text, error)."""
+
+    key = secret("OPENROUTER_API_KEY")
+
+    if not key:
+        return None, "No OPENROUTER_API_KEY found in the app Secrets."
+
+    model = openrouter_model()
+
+    if not model:
+
+        return None, (
+            "No free OpenRouter model found. "
+            "Set OPENROUTER_MODEL in the app Secrets."
         )
 
-    block, error = build_file_block(name, data)
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt}
+        ],
+        "max_tokens": 4000
+    }
 
-    if error:
-        return False, error
+    try:
+
+        response = requests.post(
+            OPENROUTER_URL,
+            headers={
+                "Authorization": f"Bearer {key}",
+                "content-type": "application/json"
+            },
+            json=payload,
+            timeout=180
+        )
+
+    except Exception as e:
+
+        return None, f"Could not connect to the AI service: {e}"
+
+    if response.status_code == 429:
+
+        return None, (
+            "The OpenRouter free limit was reached. "
+            "Wait a few minutes and try again."
+        )
+
+    if response.status_code != 200:
+
+        return None, (
+            f"OpenRouter error {response.status_code}: "
+            f"{response.text[:300]}"
+        )
+
+    try:
+
+        text = response.json()["choices"][0]["message"]["content"] or ""
+
+    except Exception:
+
+        text = ""
+
+    text = text.strip()
+
+    return (text, None) if text else (None, "OpenRouter returned no answer.")
+
+
+def ask_openrouter(block, instruction):
+    """Send a text file to OpenRouter. Returns (ok, text_or_error)."""
+
+    if block["type"] != "text":
+
+        return False, (
+            "OpenRouter free models here read text files only "
+            "(Excel, Word, CSV, TXT), not PDF or images."
+        )
+
+    text, error = _openrouter_text(
+        f"{block['text']}\n\n---\n{instruction}",
+        AI_SYSTEM_PROMPT
+    )
+
+    return (False, error) if error else (True, text)
+
+
+def provider_display(provider):
+    """Name shown next to an answer, with the model used."""
+
+    if provider == "gemini":
+        return f"Google Gemini ({secret('GEMINI_MODEL') or GEMINI_DEFAULT_MODEL})"
+
+    if provider == "openrouter":
+        return f"OpenRouter ({openrouter_model() or 'free model'})"
+
+    return f"Anthropic Claude ({AI_MODEL})"
+
+
+def _ask(provider, block, instruction):
 
     if provider == "gemini":
         return ask_gemini(block, instruction)
 
+    if provider == "openrouter":
+        return ask_openrouter(block, instruction)
+
     return ask_claude(block, instruction)
+
+
+def with_footer(text, used):
+
+    return f"{text}\n\n*Answered by {used}*"
+
+
+def run_ai(name, data, instruction, provider="auto"):
+    """Ask the AI about a file. provider: auto | gemini | openrouter |
+    anthropic. In auto mode each AI is tried until one works.
+    Returns (ok, text_or_error, name_of_the_AI_that_answered)."""
+
+    available = ai_providers()
+
+    if not available:
+
+        return False, (
+            "No AI key found. Add GEMINI_API_KEY (free), "
+            "OPENROUTER_API_KEY (free models) or ANTHROPIC_API_KEY "
+            "in the app Secrets."
+        ), ""
+
+    block, error = build_file_block(name, data)
+
+    if error:
+        return False, error, ""
+
+    if provider == "auto":
+
+        order = available
+
+    elif provider in available:
+
+        order = [provider]
+
+    else:
+
+        label = PROVIDER_LABELS.get(provider, provider)
+
+        return False, f"{label} has no key in the app Secrets.", ""
+
+    problems = []
+
+    for p in order:
+
+        ok, text = _ask(p, block, instruction)
+
+        if ok:
+            return True, text, provider_display(p)
+
+        problems.append(f"{PROVIDER_LABELS[p]}: {text}")
+
+    return False, " | ".join(problems), ""
+
+
+def compare_ai(name, data, instruction):
+    """Ask every available AI the same question.
+    Returns (list of (name, ok, text), error)."""
+
+    available = ai_providers()
+
+    if not available:
+
+        return [], "No AI key found in the app Secrets."
+
+    block, error = build_file_block(name, data)
+
+    if error:
+        return [], error
+
+    results = []
+
+    for p in available:
+
+        ok, text = _ask(p, block, instruction)
+
+        results.append((provider_display(p), ok, text))
+
+    return results, None
+
+
+def analyze_file(name, data, instruction):
+    """Send one file to the AI (auto mode). Returns (ok, text_or_error)."""
+
+    ok, text, used = run_ai(name, data, instruction)
+
+    return (True, with_footer(text, used)) if ok else (False, text)
+
+
+# =========================================================
+# EXCEL EDITING (the AI plans, the program does the editing)
+# =========================================================
+
+EDIT_SYSTEM_PROMPT = """You help a document controller edit an Excel workbook.
+You do NOT edit the file yourself: you return a JSON plan and the program applies it.
+You only see a summary of the workbook (sheet names, columns, first rows).
+Return ONLY valid JSON, no markdown, in this shape:
+{"summary": "<one or two sentences on what will be done, in the same language as the request>", "operations": [ ... ], "warnings": ["<anything unclear or risky>"]}
+
+Rules:
+- Use sheet names exactly as in the summary. A column can be a letter ("D") or the exact header text.
+- Only use the operations listed below. If the request cannot be done with them, return an empty operations list and explain why in "warnings".
+- Never invent data. If the request is ambiguous (which column? which sheet?), return no operations and say what you need in "warnings".
+- Row numbers are real sheet rows as shown in the summary.
+- If a sheet contains formulas, deleting rows or columns, removing duplicates or sorting would break them. In that case put {"op":"formulas_to_values","sheet":"S"} first and mention it in "warnings".
+
+Operations:
+{"op":"delete_columns","sheet":"S","columns":["D","Notes"]}
+{"op":"delete_rows","sheet":"S","rows":[5,6]}
+{"op":"delete_rows_where","sheet":"S","column":"C","condition":"equals|contains|empty|not_empty","value":"text"}
+{"op":"keep_rows_where","sheet":"S","column":"C","condition":"equals|contains|empty|not_empty","value":"text"}
+{"op":"rename_header","sheet":"S","column":"B","new_name":"Contract No."}
+{"op":"find_replace","sheet":"S","column":"B","find":"old","replace":"new"}   (column can be null for the whole sheet)
+{"op":"extract_to_new_sheet","sheet":"S","columns":["A","C"],"new_sheet":"Contracts","unique":true}
+{"op":"add_column","sheet":"S","header":"Total","value":"text"}   or   {"op":"add_column","sheet":"S","header":"Total","formula":"=B{row}*C{row}"}
+{"op":"trim_whitespace","sheet":"S"}
+{"op":"remove_duplicates","sheet":"S","column":"A"}   (column can be null to compare whole rows)
+{"op":"sort","sheet":"S","column":"A","descending":false}
+{"op":"formulas_to_values","sheet":"S"}   (replaces formulas by their current values)
+"""
+
+
+def _short(value, limit=40):
+
+    if value is None:
+        return ""
+
+    return str(value).replace("\n", " ").strip()[:limit]
+
+
+def detect_header_row(ws, scan=30):
+    """First row (within the first rows) that has at least 2 filled cells."""
+
+    first = None
+
+    for r in range(1, min(ws.max_row, scan) + 1):
+
+        filled = [
+            ws.cell(row=r, column=c).value
+            for c in range(1, ws.max_column + 1)
+            if ws.cell(row=r, column=c).value not in (None, "")
+        ]
+
+        if len(filled) >= 2:
+            return r
+
+        if filled and first is None:
+            first = r
+
+    return first or 1
+
+
+def workbook_summary(data, sample_rows=8, max_cols=40):
+    """Short text description of a workbook for the AI (not the whole data)."""
+
+    from openpyxl import load_workbook
+    from openpyxl.utils import get_column_letter
+
+    wb = load_workbook(io.BytesIO(data), data_only=True)
+
+    wb_formulas = load_workbook(io.BytesIO(data))
+
+    lines = []
+
+    for ws in wb.worksheets:
+
+        hr = detect_header_row(ws)
+
+        ncols = min(ws.max_column, max_cols)
+
+        formulas = _count_formulas(wb_formulas[ws.title])
+
+        lines.append(
+            f'Sheet "{ws.title}": {ws.max_row} rows, '
+            f"{ws.max_column} columns, header row = {hr}, "
+            f"formulas: {formulas} cell(s)"
+        )
+
+        heads = [
+            f"{get_column_letter(c)}={_short(ws.cell(row=hr, column=c).value)}"
+            for c in range(1, ncols + 1)
+        ]
+
+        lines.append("Columns: " + "; ".join(heads))
+
+        lines.append("Sample rows:")
+
+        shown = 0
+
+        for r in range(hr + 1, ws.max_row + 1):
+
+            row = [
+                _short(ws.cell(row=r, column=c).value)
+                for c in range(1, ncols + 1)
+            ]
+
+            if any(row):
+
+                lines.append(f"  row {r}: " + " | ".join(row))
+
+                shown += 1
+
+                if shown >= sample_rows:
+                    break
+
+        lines.append("")
+
+    wb.close()
+
+    return "\n".join(lines)[:AI_MAX_CHARS]
+
+
+def _find_sheet(wb, name):
+
+    if name:
+
+        if name in wb.sheetnames:
+            return wb[name]
+
+        for s in wb.sheetnames:
+            if s.strip().lower() == str(name).strip().lower():
+                return wb[s]
+
+        raise ValueError(f"sheet '{name}' not found")
+
+    if len(wb.sheetnames) == 1:
+        return wb[wb.sheetnames[0]]
+
+    raise ValueError("the sheet name is missing")
+
+
+def _find_col(ws, spec, header_row):
+    """Column index from a header text or a letter like D."""
+
+    from openpyxl.utils import column_index_from_string
+
+    text = str(spec).strip()
+
+    for c in range(1, ws.max_column + 1):
+
+        value = ws.cell(row=header_row, column=c).value
+
+        if value is not None and str(value).strip().lower() == text.lower():
+            return c
+
+    if re.fullmatch(r"[A-Za-z]{1,3}", text):
+
+        index = column_index_from_string(text.upper())
+
+        if index <= ws.max_column:
+            return index
+
+        raise ValueError(f"column {text} is outside the sheet")
+
+    raise ValueError(f"column '{spec}' not found")
+
+
+def _count_formulas(ws):
+
+    return sum(
+        1
+        for row in ws.iter_rows()
+        for cell in row
+        if isinstance(cell.value, str) and cell.value.startswith("=")
+    )
+
+
+def _refuse_if_formulas(ws):
+
+    if _count_formulas(ws):
+
+        raise ValueError(
+            "the sheet has formulas and this change would break them. "
+            "Convert the formulas to values first (formulas_to_values)"
+        )
+
+
+def _row_has_data(ws, r):
+
+    return any(
+        ws.cell(row=r, column=c).value not in (None, "")
+        for c in range(1, ws.max_column + 1)
+    )
+
+
+def _matches(value, condition, wanted):
+
+    text = "" if value is None else str(value).strip()
+
+    if condition == "empty":
+        return text == ""
+
+    if condition == "not_empty":
+        return text != ""
+
+    if condition == "equals":
+        return text.lower() == str(wanted).strip().lower()
+
+    if condition == "contains":
+        return str(wanted).strip().lower() in text.lower()
+
+    raise ValueError(f"unknown condition '{condition}'")
+
+
+def describe_op(op):
+    """One plain sentence for the preview shown before applying."""
+
+    kind = op.get("op", "?")
+
+    sheet = op.get("sheet")
+
+    where = f" in sheet '{sheet}'" if sheet else ""
+
+    cols = ", ".join(str(x) for x in op.get("columns", []) or [])
+
+    if kind == "delete_columns":
+        return f"Delete column(s) {cols}{where}"
+
+    if kind == "delete_rows":
+        rows = ", ".join(str(x) for x in op.get("rows", []) or [])
+        return f"Delete row(s) {rows}{where}"
+
+    if kind in ("delete_rows_where", "keep_rows_where"):
+
+        verb = "Delete" if kind == "delete_rows_where" else "Keep only"
+
+        return (
+            f"{verb} rows where column {op.get('column')} "
+            f"{op.get('condition')} {op.get('value', '')}{where}"
+        ).replace("  ", " ")
+
+    if kind == "rename_header":
+        return (
+            f"Rename the header of column {op.get('column')} to "
+            f"'{op.get('new_name')}'{where}"
+        )
+
+    if kind == "find_replace":
+
+        target = (
+            f"column {op.get('column')}" if op.get("column") else "all cells"
+        )
+
+        return (
+            f"Replace '{op.get('find')}' with '{op.get('replace')}' "
+            f"in {target}{where}"
+        )
+
+    if kind == "extract_to_new_sheet":
+
+        unique = " (unique values only)" if op.get("unique") else ""
+
+        return (
+            f"Copy column(s) {cols}{where} to a new sheet "
+            f"'{op.get('new_sheet')}'{unique}"
+        )
+
+    if kind == "add_column":
+
+        content = op.get("formula") or op.get("value") or ""
+
+        return (
+            f"Add a column '{op.get('header')}' with {content}{where}"
+        )
+
+    if kind == "trim_whitespace":
+        return f"Remove extra spaces from text cells{where}"
+
+    if kind == "formulas_to_values":
+        return f"Replace formulas by their current values{where}"
+
+    if kind == "remove_duplicates":
+
+        target = (
+            f"column {op.get('column')}" if op.get("column") else "whole rows"
+        )
+
+        return f"Remove duplicate rows by {target}{where}"
+
+    if kind == "sort":
+
+        order = "descending" if op.get("descending") else "ascending"
+
+        return f"Sort by column {op.get('column')} ({order}){where}"
+
+    return f"Unknown operation '{kind}'"
+
+
+def apply_one_op(wb, wb_values, changed_sheets, op):
+    """Apply one operation to the workbook. Returns a short result text."""
+
+    kind = op.get("op")
+
+    ws = _find_sheet(wb, op.get("sheet"))
+
+    hr = int(op.get("header_row") or detect_header_row(ws))
+
+    last = ws.max_row
+
+    if kind == "delete_columns":
+
+        indexes = sorted(
+            {_find_col(ws, spec, hr) for spec in op.get("columns", [])},
+            reverse=True
+        )
+
+        if not indexes:
+            raise ValueError("no columns given")
+
+        _refuse_if_formulas(ws)
+
+        for index in indexes:
+            ws.delete_cols(index)
+
+        changed_sheets.add(ws.title)
+
+        return f"Deleted {len(indexes)} column(s) in '{ws.title}'"
+
+    if kind == "delete_rows":
+
+        rows = sorted(
+            {int(r) for r in op.get("rows", []) if 1 <= int(r) <= last},
+            reverse=True
+        )
+
+        if not rows:
+            raise ValueError("no valid rows given")
+
+        _refuse_if_formulas(ws)
+
+        for r in rows:
+            ws.delete_rows(r)
+
+        changed_sheets.add(ws.title)
+
+        return f"Deleted {len(rows)} row(s) in '{ws.title}'"
+
+    if kind in ("delete_rows_where", "keep_rows_where"):
+
+        col = _find_col(ws, op.get("column"), hr)
+
+        condition = op.get("condition")
+
+        wanted = op.get("value", "")
+
+        hits = [
+            r for r in range(hr + 1, last + 1)
+            if _matches(ws.cell(row=r, column=col).value, condition, wanted)
+        ]
+
+        if hits or kind == "keep_rows_where":
+            _refuse_if_formulas(ws)
+
+        if kind == "keep_rows_where":
+
+            hits = [
+                r for r in range(hr + 1, last + 1)
+                if r not in set(hits) and _row_has_data(ws, r)
+            ]
+
+        for r in sorted(hits, reverse=True):
+            ws.delete_rows(r)
+
+        changed_sheets.add(ws.title)
+
+        return f"Deleted {len(hits)} row(s) in '{ws.title}'"
+
+    if kind == "rename_header":
+
+        col = _find_col(ws, op.get("column"), hr)
+
+        ws.cell(row=hr, column=col).value = op.get("new_name")
+
+        return f"Renamed a header in '{ws.title}'"
+
+    if kind == "find_replace":
+
+        find = str(op.get("find", ""))
+
+        if not find:
+            raise ValueError("nothing to find")
+
+        replace = str(op.get("replace", ""))
+
+        if op.get("column"):
+            columns = [_find_col(ws, op.get("column"), hr)]
+            first_row = hr + 1
+        else:
+            columns = range(1, ws.max_column + 1)
+            first_row = 1
+
+        count = 0
+
+        for c in columns:
+
+            for r in range(first_row, last + 1):
+
+                cell = ws.cell(row=r, column=c)
+
+                value = cell.value
+
+                if (
+                    isinstance(value, str)
+                    and not value.startswith("=")
+                    and find in value
+                ):
+
+                    cell.value = value.replace(find, replace)
+
+                    count += 1
+
+        return f"Replaced text in {count} cell(s) in '{ws.title}'"
+
+    if kind == "extract_to_new_sheet":
+
+        cols = [_find_col(ws, spec, hr) for spec in op.get("columns", [])]
+
+        if not cols:
+            raise ValueError("no columns given")
+
+        name = re.sub(r"[\[\]:*?/\\]", "", str(op.get("new_sheet") or "Extract"))
+
+        name = name.strip()[:28] or "Extract"
+
+        final = name
+        n = 2
+
+        while final in wb.sheetnames:
+            final = f"{name}_{n}"
+            n += 1
+
+        new = wb.create_sheet(final)
+
+        source_values = (
+            wb_values[ws.title]
+            if ws.title not in changed_sheets and ws.title in wb_values.sheetnames
+            else None
+        )
+
+        def read(r, c):
+
+            value = ws.cell(row=r, column=c).value
+
+            if isinstance(value, str) and value.startswith("="):
+
+                return (
+                    source_values.cell(row=r, column=c).value
+                    if source_values is not None else None
+                )
+
+            return value
+
+        new.append([ws.cell(row=hr, column=c).value for c in cols])
+
+        seen = set()
+
+        written = 0
+
+        for r in range(hr + 1, last + 1):
+
+            row = [read(r, c) for c in cols]
+
+            if all(v in (None, "") for v in row):
+                continue
+
+            if op.get("unique"):
+
+                key = tuple(str(v).strip().lower() for v in row)
+
+                if key in seen:
+                    continue
+
+                seen.add(key)
+
+            new.append(row)
+
+            written += 1
+
+        return f"Created sheet '{final}' with {written} row(s)"
+
+    if kind == "add_column":
+
+        header = op.get("header") or "New column"
+
+        formula = op.get("formula")
+
+        if formula and not str(formula).startswith("="):
+            raise ValueError("a formula must start with =")
+
+        new_col = ws.max_column + 1
+
+        ws.cell(row=hr, column=new_col).value = header
+
+        count = 0
+
+        for r in range(hr + 1, last + 1):
+
+            if not _row_has_data(ws, r):
+                continue
+
+            if formula:
+                ws.cell(row=r, column=new_col).value = str(formula).replace(
+                    "{row}", str(r)
+                )
+            else:
+                ws.cell(row=r, column=new_col).value = op.get("value", "")
+
+            count += 1
+
+        changed_sheets.add(ws.title)
+
+        return f"Added column '{header}' ({count} row(s)) in '{ws.title}'"
+
+    if kind == "trim_whitespace":
+
+        count = 0
+
+        for row in ws.iter_rows(min_row=1, max_row=last):
+
+            for cell in row:
+
+                value = cell.value
+
+                if isinstance(value, str) and not value.startswith("="):
+
+                    cleaned = " ".join(value.split())
+
+                    if cleaned != value:
+                        cell.value = cleaned
+                        count += 1
+
+        return f"Cleaned spaces in {count} cell(s) in '{ws.title}'"
+
+    if kind == "remove_duplicates":
+
+        col = _find_col(ws, op.get("column"), hr) if op.get("column") else None
+
+        seen = set()
+
+        duplicates = []
+
+        for r in range(hr + 1, last + 1):
+
+            if not _row_has_data(ws, r):
+                continue
+
+            if col:
+                key = str(ws.cell(row=r, column=col).value).strip().lower()
+            else:
+                key = tuple(
+                    str(ws.cell(row=r, column=c).value)
+                    for c in range(1, ws.max_column + 1)
+                )
+
+            if key in seen:
+                duplicates.append(r)
+            else:
+                seen.add(key)
+
+        if duplicates:
+            _refuse_if_formulas(ws)
+
+        for r in sorted(duplicates, reverse=True):
+            ws.delete_rows(r)
+
+        changed_sheets.add(ws.title)
+
+        return f"Removed {len(duplicates)} duplicate row(s) in '{ws.title}'"
+
+    if kind == "sort":
+
+        col = _find_col(ws, op.get("column"), hr)
+
+        rows = []
+
+        for r in range(hr + 1, last + 1):
+
+            values = [
+                ws.cell(row=r, column=c).value
+                for c in range(1, ws.max_column + 1)
+            ]
+
+            if any(isinstance(v, str) and v.startswith("=") for v in values):
+
+                raise ValueError(
+                    "the sheet has formulas, sorting would break them"
+                )
+
+            if any(v not in (None, "") for v in values):
+                rows.append(values)
+
+        def sort_key(values):
+
+            v = values[col - 1]
+
+            if v in (None, ""):
+                return (2, 0, "")
+
+            if isinstance(v, (int, float)):
+                return (0, v, "")
+
+            return (1, 0, str(v).strip().lower())
+
+        rows.sort(key=sort_key, reverse=bool(op.get("descending")))
+
+        for i, values in enumerate(rows):
+
+            for c, v in enumerate(values, start=1):
+                ws.cell(row=hr + 1 + i, column=c).value = v
+
+        changed_sheets.add(ws.title)
+
+        return f"Sorted {len(rows)} row(s) in '{ws.title}' (values only)"
+
+    if kind == "formulas_to_values":
+
+        if ws.title in changed_sheets:
+
+            raise ValueError(
+                "do this before other changes to the same sheet"
+            )
+
+        source = wb_values[ws.title]
+
+        count = 0
+
+        for row in ws.iter_rows():
+
+            for cell in row:
+
+                if isinstance(cell.value, str) and cell.value.startswith("="):
+
+                    stored = source.cell(
+                        row=cell.row, column=cell.column
+                    ).value
+
+                    if stored is None:
+
+                        raise ValueError(
+                            "the file has no stored results for its "
+                            "formulas. Open it in Excel, save it, and "
+                            "upload it again"
+                        )
+
+                    cell.value = stored
+
+                    count += 1
+
+        return f"Replaced {count} formula(s) by values in '{ws.title}'"
+
+    raise ValueError(f"unknown operation '{kind}'")
+
+
+def apply_edit_plan(data, operations):
+    """Apply a list of operations to a COPY of the workbook.
+    Returns (new_file_bytes, log) where log is a list of (ok, text)."""
+
+    from openpyxl import load_workbook
+
+    wb = load_workbook(io.BytesIO(data))
+
+    wb_values = load_workbook(io.BytesIO(data), data_only=True)
+
+    changed_sheets = set()
+
+    log = []
+
+    for n, op in enumerate(operations[:40], start=1):
+
+        try:
+
+            text = apply_one_op(wb, wb_values, changed_sheets, op)
+
+            log.append((True, f"{n}. {text}"))
+
+        except Exception as e:
+
+            log.append((False, f"{n}. {describe_op(op)} -> skipped: {e}"))
+
+    out = io.BytesIO()
+
+    wb.save(out)
+
+    return out.getvalue(), log
+
+
+def edited_name(file_name):
+
+    base, _ = os.path.splitext(file_name)
+
+    return f"{base} (edited).xlsx"
+
+
+def parse_plan(text):
+    """Read the AI's JSON plan. Returns (plan, error)."""
+
+    cleaned = text.strip()
+
+    cleaned = re.sub(r"^```(?:json)?|```$", "", cleaned).strip()
+
+    try:
+
+        plan = json.loads(cleaned)
+
+    except Exception:
+
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+
+        if start == -1 or end == -1:
+            return None, "The AI did not return a valid plan. Try again."
+
+        try:
+            plan = json.loads(cleaned[start:end + 1])
+        except Exception:
+            return None, "The AI did not return a valid plan. Try again."
+
+    if not isinstance(plan, dict):
+        return None, "The AI did not return a valid plan. Try again."
+
+    operations = plan.get("operations", [])
+
+    if not isinstance(operations, list):
+        return None, "The AI plan has no operations list."
+
+    plan["operations"] = [o for o in operations if isinstance(o, dict)][:40]
+
+    warnings = plan.get("warnings", [])
+
+    plan["warnings"] = [str(w) for w in warnings] if isinstance(warnings, list) else []
+
+    plan["summary"] = str(plan.get("summary", ""))
+
+    return plan, None
+
+
+def _gemini_text(prompt, system, json_mode=False):
+    """Plain text request to Gemini. Returns (text, error)."""
+
+    key = secret("GEMINI_API_KEY")
+
+    if not key:
+        return None, "No GEMINI_API_KEY found in the app Secrets."
+
+    model = secret("GEMINI_MODEL") or GEMINI_DEFAULT_MODEL
+
+    config = {"maxOutputTokens": 8192}
+
+    if json_mode:
+        config["responseMimeType"] = "application/json"
+
+    payload = {
+        "system_instruction": {"parts": [{"text": system}]},
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": config
+    }
+
+    try:
+
+        response = requests.post(
+            GEMINI_URL.format(model=model),
+            headers={
+                "x-goog-api-key": key,
+                "content-type": "application/json"
+            },
+            json=payload,
+            timeout=180
+        )
+
+    except Exception as e:
+
+        return None, f"Could not connect to the AI service: {e}"
+
+    if response.status_code == 429:
+
+        return None, (
+            "The free AI limit was reached (too many requests). "
+            "Wait a few minutes and try again."
+        )
+
+    if response.status_code != 200:
+
+        return None, (
+            f"AI service error {response.status_code}: "
+            f"{response.text[:300]}"
+        )
+
+    texts = []
+
+    for candidate in response.json().get("candidates", []):
+
+        for p in candidate.get("content", {}).get("parts", []):
+
+            if "text" in p:
+                texts.append(p["text"])
+
+        if texts:
+            break
+
+    text = "\n".join(texts).strip()
+
+    return (text, None) if text else (None, "The AI returned no answer.")
+
+
+def _claude_text(prompt, system):
+    """Plain text request to Claude. Returns (text, error)."""
+
+    key = secret("ANTHROPIC_API_KEY")
+
+    if not key:
+        return None, "No ANTHROPIC_API_KEY found in the app Secrets."
+
+    payload = {
+        "model": AI_MODEL,
+        "max_tokens": 4000,
+        "system": system,
+        "messages": [{"role": "user", "content": prompt}]
+    }
+
+    try:
+
+        response = requests.post(
+            AI_URL,
+            headers={
+                "x-api-key": key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+            },
+            json=payload,
+            timeout=180
+        )
+
+    except Exception as e:
+
+        return None, f"Could not connect to the AI service: {e}"
+
+    if response.status_code != 200:
+
+        return None, (
+            f"AI service error {response.status_code}: "
+            f"{response.text[:300]}"
+        )
+
+    text = "\n".join(
+        b.get("text", "")
+        for b in response.json().get("content", [])
+        if b.get("type") == "text"
+    ).strip()
+
+    return (text, None) if text else (None, "The AI returned no answer.")
+
+
+def ask_ai_plan(summary_text, instruction):
+    """Ask the AI for an edit plan, trying each AI until one gives a valid
+    plan. Returns (plan, error)."""
+
+    available = ai_providers()
+
+    if not available:
+
+        return None, (
+            "No AI key found. Add GEMINI_API_KEY (free), "
+            "OPENROUTER_API_KEY (free models) or ANTHROPIC_API_KEY "
+            "in the app Secrets."
+        )
+
+    prompt = (
+        f"WORKBOOK SUMMARY:\n{summary_text}\n\n"
+        f"USER REQUEST:\n{instruction}"
+    )
+
+    problems = []
+
+    for p in available:
+
+        if p == "gemini":
+            text, error = _gemini_text(prompt, EDIT_SYSTEM_PROMPT, json_mode=True)
+
+        elif p == "openrouter":
+            text, error = _openrouter_text(prompt, EDIT_SYSTEM_PROMPT)
+
+        else:
+            text, error = _claude_text(prompt, EDIT_SYSTEM_PROMPT)
+
+        if error:
+
+            problems.append(f"{PROVIDER_LABELS[p]}: {error}")
+
+            continue
+
+        plan, error = parse_plan(text)
+
+        if error:
+
+            problems.append(f"{PROVIDER_LABELS[p]}: {error}")
+
+            continue
+
+        plan["provider"] = provider_display(p)
+
+        return plan, None
+
+    return None, " | ".join(problems)
 
 
 # ===== UI =====
@@ -1265,6 +2442,207 @@ def show_documents_table(documents, can_delete):
                     confirm_delete_dialog(d[0], d[2], d[1], d[7])
 
             st.markdown(line, unsafe_allow_html=True)
+
+
+# =========================================================
+# EXCEL EDITOR (AI page, admin only)
+# =========================================================
+
+XLSX_MIME = (
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
+
+
+def show_excel_editor(project_number, docs):
+
+    xlsx_docs = [d for d in docs if str(d[2]).lower().endswith(".xlsx")]
+
+    if not xlsx_docs:
+
+        st.info(
+            "No .xlsx files in this project yet. "
+            "Only .xlsx files can be edited."
+        )
+
+        return
+
+    options = {f"{d[2]} | {d[6]}": d for d in xlsx_docs}
+
+    choice = st.selectbox(
+        "Excel file",
+        list(options.keys()),
+        key="edit_file"
+    )
+
+    doc = options[choice]
+
+    st.warning(
+        "The original file is never changed: you get an edited COPY. "
+        "Charts, images, pivot tables and macros inside the file "
+        "are not kept in the copy."
+    )
+
+    instruction = st.text_area(
+        "What should be changed?",
+        placeholder=(
+            "Example: delete column D, and copy all contract numbers "
+            "to a new sheet (unique values)"
+        ),
+        height=100,
+        key="edit_instruction"
+    )
+
+    if st.button("🧠 Plan the edit", key="edit_plan_button"):
+
+        if not instruction.strip():
+
+            st.error("Please write what you want to change.")
+
+        else:
+
+            error = None
+
+            with st.spinner("The AI is reading the file and planning..."):
+
+                data = download_bytes(doc[7])
+
+                if data is None:
+
+                    error = "Could not read the file."
+
+                else:
+
+                    try:
+                        summary = workbook_summary(data)
+                    except Exception as e:
+                        summary = None
+                        error = f"Could not read the Excel file: {e}"
+
+                if error is None:
+                    plan, error = ask_ai_plan(summary, instruction.strip())
+
+            if error:
+
+                st.error(error)
+
+            else:
+
+                st.session_state.edit_plan = {"doc_id": doc[0], "plan": plan}
+
+                st.session_state.pop("edit_result", None)
+
+    state = st.session_state.get("edit_plan")
+
+    if state and state["doc_id"] == doc[0]:
+
+        plan = state["plan"]
+
+        st.subheader("The plan")
+
+        if plan["summary"]:
+            st.write(plan["summary"])
+
+        if plan.get("provider"):
+            st.caption(f"Plan made by {plan['provider']}")
+
+        for warning in plan["warnings"]:
+            st.caption(f"⚠️ {warning}")
+
+        operations = plan["operations"]
+
+        if not operations:
+
+            st.info("The AI found nothing it can change with this request.")
+
+        else:
+
+            for i, op in enumerate(operations, start=1):
+                st.markdown(f"{i}. {md_safe(describe_op(op))}")
+
+            if st.button(
+                "✅ Apply and create the file",
+                key="edit_apply_button",
+                use_container_width=True
+            ):
+
+                with st.spinner("Editing the file..."):
+
+                    data = download_bytes(doc[7])
+
+                    if data is None:
+
+                        st.error("Could not read the file.")
+
+                    else:
+
+                        new_bytes, log = apply_edit_plan(data, operations)
+
+                        st.session_state.edit_result = {
+                            "doc_id": doc[0],
+                            "bytes": new_bytes,
+                            "name": edited_name(doc[2]),
+                            "log": log
+                        }
+
+    result = st.session_state.get("edit_result")
+
+    if result and result["doc_id"] == doc[0]:
+
+        st.subheader("Result")
+
+        for ok, text in result["log"]:
+
+            st.write(("✅ " if ok else "⚠️ ") + text)
+
+        st.download_button(
+            "⬇️ Download the edited file",
+            data=result["bytes"],
+            file_name=result["name"],
+            mime=XLSX_MIME,
+            use_container_width=True
+        )
+
+        if st.button(
+            "💾 Also save the edited file in this project",
+            key="edit_save_button",
+            use_container_width=True
+        ):
+
+            project_id = get_project_id(project_number)
+
+            if project_id is None:
+
+                st.error("Project not found.")
+
+            else:
+
+                path, error = upload_file(
+                    project_id,
+                    result["name"],
+                    result["bytes"],
+                    XLSX_MIME
+                )
+
+                if error:
+
+                    st.error(error)
+
+                else:
+
+                    ok, message = add_document(
+                        project_number,
+                        result["name"],
+                        path,
+                        "XLSX",
+                        len(result["bytes"]),
+                        f"AI-edited copy of {doc[2]}"
+                    )
+
+                    if ok:
+                        st.success("Saved. It now appears in Documents.")
+                    else:
+                        delete_storage([path])
+                        st.error(message)
 
 
 # =========================================================
@@ -1958,7 +3336,7 @@ elif page == "🪄 AI":
 
     st.title("🪄 AI")
 
-    st.caption(f"AI provider: {ai_provider_label()}")
+    st.caption(f"AI ready: {ai_provider_label()}")
 
     if is_admin:
 
@@ -1991,9 +3369,23 @@ elif page == "🪄 AI":
 
         if is_admin:
 
+            ai_mode = st.radio(
+                "What do you want?",
+                [
+                    "📝 Analyze a file (text answer)",
+                    "✏️ Edit an Excel file (get a new file)"
+                ],
+                horizontal=True,
+                key="ai_mode"
+            )
+
             ai_docs = get_documents(ai_project)
 
-            if ai_docs:
+            if ai_mode.startswith("✏️"):
+
+                show_excel_editor(ai_project, ai_docs)
+
+            elif ai_docs:
 
                 ai_file_options = {
                     f"{d[2]} | {d[6]}": d for d in ai_docs
@@ -2012,40 +3404,104 @@ elif page == "🪄 AI":
                     key="ai_report_prompt"
                 )
 
-                if st.button("🪄 Run AI", key="ai_report_run"):
+                provider_choices = ai_provider_choices()
 
-                    chosen = ai_file_options[ai_file]
+                if not provider_choices:
 
-                    with st.spinner("🪄 AI is analyzing..."):
+                    st.warning(
+                        "No AI key found. Add GEMINI_API_KEY (free), "
+                        "OPENROUTER_API_KEY (free models) or "
+                        "ANTHROPIC_API_KEY in the app Secrets."
+                    )
 
-                        file_data = download_bytes(chosen[7])
+                else:
 
-                        if file_data is None:
+                    which_label = st.selectbox(
+                        "Which AI?",
+                        list(provider_choices.keys()),
+                        key="ai_report_provider"
+                    )
 
-                            ai_ok, result = False, "Could not read the file."
+                    which = provider_choices[which_label]
 
-                        else:
+                    if st.button("🪄 Run AI", key="ai_report_run"):
 
-                            ai_ok, result = analyze_file(
-                                chosen[2],
-                                file_data,
-                                ai_prompt
-                            )
+                        chosen = ai_file_options[ai_file]
 
-                    if ai_ok:
+                        with st.spinner("🪄 AI is analyzing..."):
 
-                        save_ai_result(
-                            ai_project,
-                            chosen[2],
-                            ai_prompt,
-                            result
-                        )
+                            file_data = download_bytes(chosen[7])
 
-                        st.success("Done. The result is saved below.")
+                            if file_data is None:
 
-                    else:
+                                st.error("Could not read the file.")
 
-                        st.error(result)
+                            elif which == "compare":
+
+                                answers, problem = compare_ai(
+                                    chosen[2],
+                                    file_data,
+                                    ai_prompt
+                                )
+
+                                if problem:
+
+                                    st.error(problem)
+
+                                else:
+
+                                    saved = 0
+
+                                    for label, ok, text in answers:
+
+                                        with st.expander(label, expanded=True):
+
+                                            if ok:
+                                                st.markdown(text)
+                                            else:
+                                                st.error(text)
+
+                                        if ok:
+
+                                            save_ai_result(
+                                                ai_project,
+                                                chosen[2],
+                                                ai_prompt,
+                                                with_footer(text, label)
+                                            )
+
+                                            saved += 1
+
+                                    st.success(
+                                        f"{saved} answer(s) saved below."
+                                    )
+
+                            else:
+
+                                ok, text, used = run_ai(
+                                    chosen[2],
+                                    file_data,
+                                    ai_prompt,
+                                    which
+                                )
+
+                                if ok:
+
+                                    save_ai_result(
+                                        ai_project,
+                                        chosen[2],
+                                        ai_prompt,
+                                        with_footer(text, used)
+                                    )
+
+                                    st.success(
+                                        f"Done ({used}). "
+                                        "The result is saved below."
+                                    )
+
+                                else:
+
+                                    st.error(text)
 
             else:
 
