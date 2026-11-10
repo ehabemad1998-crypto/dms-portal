@@ -632,24 +632,7 @@ def upload_file(project_id, file_name, data, content_type):
     return None, f"Upload failed ({err(r)})"
 
 
-def signed_url(path, file_name):
-    """Temporary (1 hour) download link for a stored file."""
-
-    r = api(
-        "POST",
-        f"/storage/v1/object/sign/{BUCKET}/{path}",
-        json_body={"expiresIn": 3600}
-    )
-
-    if r.status_code != 200:
-        return None
-
-    body = r.json()
-
-    signed = body.get("signedURL") or body.get("signedUrl")
-
-    if not signed:
-        return None
+def _full_signed_url(signed, file_name):
 
     if signed.startswith("http"):
         url = signed
@@ -667,6 +650,70 @@ def signed_url(path, file_name):
     joiner = "&" if "?" in url else "?"
 
     return f"{url}{joiner}download={quote(file_name)}"
+
+
+def signed_url(path, file_name):
+    """Temporary (1 hour) download link for one stored file."""
+
+    r = api(
+        "POST",
+        f"/storage/v1/object/sign/{BUCKET}/{path}",
+        json_body={"expiresIn": 3600}
+    )
+
+    if r.status_code != 200:
+        return None
+
+    body = r.json()
+
+    signed = body.get("signedURL") or body.get("signedUrl")
+
+    return _full_signed_url(signed, file_name) if signed else None
+
+
+def signed_urls(items):
+    """Download links for many files. items: list of (path, file_name).
+    Returns {path: url}. One request for all (single ones as a fallback)."""
+
+    if not items:
+        return {}
+
+    names = dict(items)
+
+    urls = {}
+
+    r = api(
+        "POST",
+        f"/storage/v1/object/sign/{BUCKET}",
+        json_body={"expiresIn": 3600, "paths": list(names.keys())}
+    )
+
+    if r.status_code == 200:
+
+        try:
+
+            for entry in r.json():
+
+                signed = entry.get("signedURL") or entry.get("signedUrl")
+
+                path = entry.get("path")
+
+                if signed and path in names:
+                    urls[path] = _full_signed_url(signed, names[path])
+
+        except Exception:
+            urls = {}
+
+    for path, file_name in items:
+
+        if path not in urls:
+
+            single = signed_url(path, file_name)
+
+            if single:
+                urls[path] = single
+
+    return urls
 
 
 def download_bytes(path):
@@ -690,27 +737,6 @@ AI_URL = "https://api.anthropic.com/v1/messages"
 
 AI_MAX_CHARS = 60000
 
-AI_DEFAULT_INSTRUCTION = (
-    "Summarize this file for a document controller: what it is, "
-    "the key data (numbers, dates, revisions, quantities), "
-    "and anything missing or unclear."
-)
-
-AI_SYSTEM_PROMPT = (
-    "You are an assistant for a document controller at an engineering "
-    "company. Be accurate and concise. Never invent numbers or data that "
-    "are not in the file; say clearly when something is missing or unclear. "
-    "Reply in the same language as the user's instruction."
-)
-
-IMAGE_TYPES = {
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".gif": "image/gif",
-    ".webp": "image/webp"
-}
-
 
 def save_ai_result(project_number, file_name, request_text, result):
 
@@ -725,6 +751,34 @@ def save_ai_result(project_number, file_name, request_text, result):
         },
         headers={"Prefer": "return=minimal"}
     )
+
+
+def get_recent_ai_results(limit=30):
+    """Latest requests: (project, file, request, result, date)."""
+
+    r = api(
+        "GET",
+        "/rest/v1/ai_results",
+        params={
+            "select": "project_number,file_name,request,result,created_at",
+            "order": "id.desc",
+            "limit": limit
+        }
+    )
+
+    if r.status_code != 200:
+        return []
+
+    return [
+        (
+            x["project_number"],
+            x["file_name"],
+            x["request"] or "",
+            x["result"] or "",
+            fmt_time(x["created_at"])
+        )
+        for x in r.json()
+    ]
 
 
 def get_ai_results(project_number):
@@ -752,109 +806,6 @@ def get_ai_results(project_number):
         )
         for x in r.json()
     ]
-
-
-def excel_to_text(data, max_rows=300, max_cols=40):
-
-    from openpyxl import load_workbook
-
-    wb = load_workbook(io.BytesIO(data), data_only=True, read_only=True)
-
-    parts = []
-
-    for ws in wb.worksheets:
-
-        parts.append(f"=== Sheet: {ws.title} ===")
-
-        for i, row in enumerate(ws.iter_rows(values_only=True)):
-
-            if i >= max_rows:
-                parts.append(f"... (cut after {max_rows} rows)")
-                break
-
-            cells = [
-                "" if c is None else str(c)
-                for c in row[:max_cols]
-            ]
-
-            if any(cells):
-                parts.append(" | ".join(cells))
-
-    wb.close()
-
-    return "\n".join(parts)[:AI_MAX_CHARS]
-
-
-def docx_to_text(data):
-
-    with zipfile.ZipFile(io.BytesIO(data)) as z:
-        xml = z.read("word/document.xml").decode("utf-8", errors="replace")
-
-    xml = xml.replace("</w:p>", "\n")
-
-    text = re.sub(r"<[^>]+>", "", xml)
-
-    return html.unescape(text)[:AI_MAX_CHARS]
-
-
-def build_file_block(name, data):
-    """Turn a file into a message block for the AI. Returns (block, error)."""
-
-    ext = os.path.splitext(name)[1].lower()
-
-    try:
-
-        if ext == ".pdf" or ext in IMAGE_TYPES:
-
-            if len(data) > 20 * 1024 * 1024:
-                return None, f"{name} is larger than 20 MB, too big for AI."
-
-            encoded = base64.b64encode(data).decode()
-
-            if ext == ".pdf":
-
-                return {
-                    "type": "document",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "application/pdf",
-                        "data": encoded
-                    }
-                }, None
-
-            return {
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": IMAGE_TYPES[ext],
-                    "data": encoded
-                }
-            }, None
-
-        if ext in (".xlsx", ".xlsm"):
-            text = excel_to_text(data)
-
-        elif ext == ".docx":
-            text = docx_to_text(data)
-
-        elif ext in (".csv", ".txt", ".md", ".json"):
-            text = data.decode("utf-8", errors="replace")[:AI_MAX_CHARS]
-
-        else:
-
-            return None, (
-                f"File type {ext or '(none)'} is not supported by AI yet. "
-                "Supported: Excel (.xlsx), PDF, Word (.docx), "
-                "images, CSV/TXT."
-            )
-
-    except Exception as e:
-        return None, f"Could not read {name}: {e}"
-
-    return {
-        "type": "text",
-        "text": f"File name: {name}\n\n{text}"
-    }, None
 
 
 GEMINI_URL = (
@@ -900,178 +851,6 @@ def ai_provider_label():
     names = [PROVIDER_LABELS[p] for p in ai_providers()]
 
     return ", ".join(names) if names else "not set"
-
-
-def ai_provider_choices():
-    """Choices for the 'Which AI?' list: label -> code."""
-
-    available = ai_providers()
-
-    choices = {}
-
-    if len(available) > 1:
-        choices["Auto (try each AI until one works)"] = "auto"
-
-    for p in available:
-        choices[PROVIDER_LABELS[p]] = p
-
-    if len(available) > 1:
-        choices["Compare all (see every answer)"] = "compare"
-
-    return choices
-
-
-def ask_gemini(block, instruction):
-    """Send one file block to Google Gemini. Returns (ok, text_or_error)."""
-
-    key = secret("GEMINI_API_KEY")
-
-    if not key:
-        return False, "No GEMINI_API_KEY found in the app Secrets."
-
-    model = secret("GEMINI_MODEL") or GEMINI_DEFAULT_MODEL
-
-    if block["type"] == "text":
-
-        part = {"text": block["text"]}
-
-    else:
-
-        source = block["source"]
-
-        if len(source["data"]) > 19_000_000:
-
-            return False, (
-                "This file is too large for the free AI "
-                "(about 14 MB at most)."
-            )
-
-        part = {
-            "inline_data": {
-                "mime_type": source["media_type"],
-                "data": source["data"]
-            }
-        }
-
-    payload = {
-        "system_instruction": {"parts": [{"text": AI_SYSTEM_PROMPT}]},
-        "contents": [
-            {
-                "role": "user",
-                "parts": [part, {"text": instruction}]
-            }
-        ],
-        "generationConfig": {"maxOutputTokens": 8192}
-    }
-
-    try:
-
-        response = requests.post(
-            GEMINI_URL.format(model=model),
-            headers={
-                "x-goog-api-key": key,
-                "content-type": "application/json"
-            },
-            json=payload,
-            timeout=180
-        )
-
-    except Exception as e:
-
-        return False, f"Could not connect to the AI service: {e}"
-
-    if response.status_code == 429:
-
-        return False, (
-            "The free AI limit was reached (too many requests). "
-            "Wait a few minutes and try again."
-        )
-
-    if response.status_code != 200:
-
-        return False, (
-            f"AI service error {response.status_code}: "
-            f"{response.text[:300]}"
-        )
-
-    data = response.json()
-
-    texts = []
-
-    for candidate in data.get("candidates", []):
-
-        for p in candidate.get("content", {}).get("parts", []):
-
-            if "text" in p:
-                texts.append(p["text"])
-
-        if texts:
-            break
-
-    text = "\n".join(texts).strip()
-
-    if not text:
-
-        reason = data.get("promptFeedback", {}).get("blockReason", "")
-
-        return False, "The AI returned no answer" + (
-            f" ({reason})." if reason else "."
-        )
-
-    return True, text
-
-
-def ask_claude(block, instruction):
-    """Send one file block to Anthropic Claude. Returns (ok, text_or_error)."""
-
-    key = secret("ANTHROPIC_API_KEY")
-
-    if not key:
-        return False, "No ANTHROPIC_API_KEY found in the app Secrets."
-
-    payload = {
-        "model": AI_MODEL,
-        "max_tokens": 2000,
-        "system": AI_SYSTEM_PROMPT,
-        "messages": [
-            {
-                "role": "user",
-                "content": [block, {"type": "text", "text": instruction}]
-            }
-        ]
-    }
-
-    try:
-
-        response = requests.post(
-            AI_URL,
-            headers={
-                "x-api-key": key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json"
-            },
-            json=payload,
-            timeout=180
-        )
-
-    except Exception as e:
-
-        return False, f"Could not connect to the AI service: {e}"
-
-    if response.status_code != 200:
-
-        return False, (
-            f"AI service error {response.status_code}: "
-            f"{response.text[:300]}"
-        )
-
-    text = "\n".join(
-        b.get("text", "")
-        for b in response.json().get("content", [])
-        if b.get("type") == "text"
-    ).strip()
-
-    return True, text or "(AI returned an empty answer.)"
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -1199,24 +978,6 @@ def _openrouter_text(prompt, system):
     return (text, None) if text else (None, "OpenRouter returned no answer.")
 
 
-def ask_openrouter(block, instruction):
-    """Send a text file to OpenRouter. Returns (ok, text_or_error)."""
-
-    if block["type"] != "text":
-
-        return False, (
-            "OpenRouter free models here read text files only "
-            "(Excel, Word, CSV, TXT), not PDF or images."
-        )
-
-    text, error = _openrouter_text(
-        f"{block['text']}\n\n---\n{instruction}",
-        AI_SYSTEM_PROMPT
-    )
-
-    return (False, error) if error else (True, text)
-
-
 def provider_display(provider):
     """Name shown next to an answer, with the model used."""
 
@@ -1227,104 +988,6 @@ def provider_display(provider):
         return f"OpenRouter ({openrouter_model() or 'free model'})"
 
     return f"Anthropic Claude ({AI_MODEL})"
-
-
-def _ask(provider, block, instruction):
-
-    if provider == "gemini":
-        return ask_gemini(block, instruction)
-
-    if provider == "openrouter":
-        return ask_openrouter(block, instruction)
-
-    return ask_claude(block, instruction)
-
-
-def with_footer(text, used):
-
-    return f"{text}\n\n*Answered by {used}*"
-
-
-def run_ai(name, data, instruction, provider="auto"):
-    """Ask the AI about a file. provider: auto | gemini | openrouter |
-    anthropic. In auto mode each AI is tried until one works.
-    Returns (ok, text_or_error, name_of_the_AI_that_answered)."""
-
-    available = ai_providers()
-
-    if not available:
-
-        return False, (
-            "No AI key found. Add GEMINI_API_KEY (free), "
-            "OPENROUTER_API_KEY (free models) or ANTHROPIC_API_KEY "
-            "in the app Secrets."
-        ), ""
-
-    block, error = build_file_block(name, data)
-
-    if error:
-        return False, error, ""
-
-    if provider == "auto":
-
-        order = available
-
-    elif provider in available:
-
-        order = [provider]
-
-    else:
-
-        label = PROVIDER_LABELS.get(provider, provider)
-
-        return False, f"{label} has no key in the app Secrets.", ""
-
-    problems = []
-
-    for p in order:
-
-        ok, text = _ask(p, block, instruction)
-
-        if ok:
-            return True, text, provider_display(p)
-
-        problems.append(f"{PROVIDER_LABELS[p]}: {text}")
-
-    return False, " | ".join(problems), ""
-
-
-def compare_ai(name, data, instruction):
-    """Ask every available AI the same question.
-    Returns (list of (name, ok, text), error)."""
-
-    available = ai_providers()
-
-    if not available:
-
-        return [], "No AI key found in the app Secrets."
-
-    block, error = build_file_block(name, data)
-
-    if error:
-        return [], error
-
-    results = []
-
-    for p in available:
-
-        ok, text = _ask(p, block, instruction)
-
-        results.append((provider_display(p), ok, text))
-
-    return results, None
-
-
-def analyze_file(name, data, instruction):
-    """Send one file to the AI (auto mode). Returns (ok, text_or_error)."""
-
-    ok, text, used = run_ai(name, data, instruction)
-
-    return (True, with_footer(text, used)) if ok else (False, text)
 
 
 # =========================================================
@@ -1342,6 +1005,7 @@ Rules:
 - Only use the operations listed below. If the request cannot be done with them, return an empty operations list and explain why in "warnings".
 - Never invent data. If the request is ambiguous (which column? which sheet?), return no operations and say what you need in "warnings".
 - Row numbers are real sheet rows as shown in the summary.
+- To give the user a NEW file that contains only some data (an export), first use extract_to_new_sheet, then delete_sheets for the original sheets.
 - If a sheet contains formulas, deleting rows or columns, removing duplicates or sorting would break them. In that case put {"op":"formulas_to_values","sheet":"S"} first and mention it in "warnings".
 
 Operations:
@@ -1357,6 +1021,8 @@ Operations:
 {"op":"remove_duplicates","sheet":"S","column":"A"}   (column can be null to compare whole rows)
 {"op":"sort","sheet":"S","column":"A","descending":false}
 {"op":"formulas_to_values","sheet":"S"}   (replaces formulas by their current values)
+{"op":"delete_sheets","sheets":["Sheet1","Old"]}
+{"op":"rename_sheet","sheet":"Old name","new_name":"New name"}
 """
 
 
@@ -1623,6 +1289,45 @@ def describe_op(op):
 
         return f"Sort by column {op.get('column')} ({order}){where}"
 
+    if kind == "delete_sheets":
+        names = op.get("sheets") or [op.get("sheet")]
+        return "Delete sheet(s) " + ", ".join(str(x) for x in names)
+
+    if kind == "rename_sheet":
+        return f"Rename sheet '{sheet}' to '{op.get('new_name')}'"
+
+    if kind == "delete_pages":
+        return f"Delete page(s) {_fmt_pages(op.get('pages'))}"
+
+    if kind == "keep_pages":
+        return f"Keep only page(s) {_fmt_pages(op.get('pages'))}"
+
+    if kind == "reorder_pages":
+        return f"Reorder the pages: {_fmt_pages(op.get('order'))}"
+
+    if kind == "rotate_pages":
+
+        return (
+            f"Rotate page(s) {_fmt_pages(op.get('pages', 'all'))} "
+            f"by {op.get('degrees', 90)} degrees"
+        )
+
+    if kind in ("add_watermark", "add_stamp"):
+
+        what = "watermark" if kind == "add_watermark" else "stamp"
+
+        return (
+            f"Add {what} '{op.get('text')}' on page(s) "
+            f"{_fmt_pages(op.get('pages', 'all'))}"
+        )
+
+    if kind == "append_pdf":
+
+        return (
+            f"Add the pages of '{op.get('file')}' at the "
+            f"{op.get('position', 'end')}"
+        )
+
     return f"Unknown operation '{kind}'"
 
 
@@ -1630,6 +1335,45 @@ def apply_one_op(wb, wb_values, changed_sheets, op):
     """Apply one operation to the workbook. Returns a short result text."""
 
     kind = op.get("op")
+
+    if kind == "delete_sheets":
+
+        names = op.get("sheets") or [op.get("sheet")]
+
+        removed = []
+
+        for sheet_name in names:
+
+            target = _find_sheet(wb, sheet_name)
+
+            if len(wb.sheetnames) == 1:
+                raise ValueError("a workbook needs at least one sheet")
+
+            removed.append(target.title)
+
+            wb.remove(target)
+
+        return "Deleted sheet(s) " + ", ".join(removed)
+
+    if kind == "rename_sheet":
+
+        target = _find_sheet(wb, op.get("sheet"))
+
+        new_name = re.sub(
+            r"[\[\]:*?/\\]", "", str(op.get("new_name") or "")
+        ).strip()[:31]
+
+        if not new_name:
+            raise ValueError("no new name given")
+
+        if new_name in wb.sheetnames and new_name != target.title:
+            raise ValueError("a sheet with this name already exists")
+
+        old_name = target.title
+
+        target.title = new_name
+
+        return f"Renamed sheet '{old_name}' to '{new_name}'"
 
     ws = _find_sheet(wb, op.get("sheet"))
 
@@ -2024,11 +1768,11 @@ def apply_edit_plan(data, operations):
     return out.getvalue(), log
 
 
-def edited_name(file_name):
+def edited_name(file_name, kind="excel"):
 
     base, _ = os.path.splitext(file_name)
 
-    return f"{base} (edited).xlsx"
+    return f"{base} (edited).{'pdf' if kind == 'pdf' else 'xlsx'}"
 
 
 def parse_plan(text):
@@ -2190,9 +1934,10 @@ def _claude_text(prompt, system):
     return (text, None) if text else (None, "The AI returned no answer.")
 
 
-def ask_ai_plan(summary_text, instruction):
-    """Ask the AI for an edit plan, trying each AI until one gives a valid
-    plan. Returns (plan, error)."""
+def ask_ai_plan(summary_text, instruction, system=EDIT_SYSTEM_PROMPT,
+                provider="auto"):
+    """Ask the AI for an edit plan. In auto mode each AI is tried until one
+    gives a valid plan. Returns (plan, error)."""
 
     available = ai_providers()
 
@@ -2204,23 +1949,38 @@ def ask_ai_plan(summary_text, instruction):
             "in the app Secrets."
         )
 
+    if provider == "auto":
+
+        order = available
+
+    elif provider in available:
+
+        order = [provider]
+
+    else:
+
+        return None, (
+            f"{PROVIDER_LABELS.get(provider, provider)} "
+            "has no key in the app Secrets."
+        )
+
     prompt = (
-        f"WORKBOOK SUMMARY:\n{summary_text}\n\n"
+        f"FILE SUMMARY:\n{summary_text}\n\n"
         f"USER REQUEST:\n{instruction}"
     )
 
     problems = []
 
-    for p in available:
+    for p in order:
 
         if p == "gemini":
-            text, error = _gemini_text(prompt, EDIT_SYSTEM_PROMPT, json_mode=True)
+            text, error = _gemini_text(prompt, system, json_mode=True)
 
         elif p == "openrouter":
-            text, error = _openrouter_text(prompt, EDIT_SYSTEM_PROMPT)
+            text, error = _openrouter_text(prompt, system)
 
         else:
-            text, error = _claude_text(prompt, EDIT_SYSTEM_PROMPT)
+            text, error = _claude_text(prompt, system)
 
         if error:
 
@@ -2241,6 +2001,381 @@ def ask_ai_plan(summary_text, instruction):
         return plan, None
 
     return None, " | ".join(problems)
+
+
+# =========================================================
+# PDF EDITING (the AI plans, the program does the editing)
+# =========================================================
+
+PDF_SYSTEM_PROMPT = """You help a document controller edit a PDF file.
+You do NOT edit the file yourself: you return a JSON plan and the program applies it.
+You only see a summary: the page count and the first words of each page (scanned pages may have no text).
+Return ONLY valid JSON, no markdown, in this shape:
+{"summary": "<one or two sentences on what will be done, in the same language as the request>", "operations": [ ... ], "warnings": ["<anything unclear or risky>"]}
+
+Rules:
+- Pages are numbered from 1. Operations run in order, and page numbers always refer to the file as it is at that step (after the earlier operations).
+- You can only work on whole pages and add a watermark or stamp. You cannot change the text inside a page: if asked, return no operations and explain in "warnings".
+- Never invent. If the request is ambiguous (which pages?), return no operations and say what you need in "warnings".
+- Pages can be numbers, ranges like "3-5", or "all".
+- Watermark and stamp text must use English letters and numbers only.
+
+Operations:
+{"op":"delete_pages","pages":[3,"5-7"]}
+{"op":"keep_pages","pages":[1,2,"4-6"]}   (keeps only these pages, in this order)
+{"op":"reorder_pages","order":[3,1,2]}   (the complete new order: every page exactly once)
+{"op":"rotate_pages","pages":[2],"degrees":90}   (90, 180 or 270; pages can be "all")
+{"op":"add_watermark","text":"SUPERSEDED","pages":"all"}   (big diagonal light text)
+{"op":"add_stamp","text":"IFC","position":"top-right","pages":"all"}   (small red text; position: top-left, top-center, top-right, bottom-left, bottom-center, bottom-right)
+{"op":"append_pdf","file":"other.pdf","position":"end"}   (adds all pages of another PDF listed in the summary; position: start or end)
+"""
+
+
+def _fmt_pages(spec):
+
+    if isinstance(spec, list):
+        return ", ".join(str(x) for x in spec)
+
+    return str(spec)
+
+
+def _pages_from(spec, total):
+    """Page numbers from 'all', 5, '3-5' or a list of those (order kept)."""
+
+    if spec in (None, "", "all"):
+        return list(range(1, total + 1))
+
+    items = spec if isinstance(spec, list) else [spec]
+
+    found = []
+
+    for item in items:
+
+        text = str(item).strip().lower()
+
+        if text == "all":
+
+            found.extend(range(1, total + 1))
+
+            continue
+
+        match = re.fullmatch(r"(\d+)\s*-\s*(\d+)", text)
+
+        if match:
+
+            a, b = int(match.group(1)), int(match.group(2))
+
+            found.extend(range(a, b + 1) if a <= b else range(a, b - 1, -1))
+
+        elif text.isdigit():
+
+            found.append(int(text))
+
+        else:
+
+            raise ValueError(f"'{item}' is not a page number")
+
+    outside = sorted({p for p in found if p < 1 or p > total})
+
+    if outside:
+
+        raise ValueError(
+            f"page(s) {outside} are outside the file (1 to {total})"
+        )
+
+    return found
+
+
+def _open_pdf(data):
+
+    from pypdf import PdfReader
+
+    reader = PdfReader(io.BytesIO(data))
+
+    if reader.is_encrypted:
+
+        try:
+            opened = reader.decrypt("")
+        except Exception:
+            opened = 0
+
+        if not opened:
+            raise ValueError("the PDF is password protected")
+
+    return reader
+
+
+def pdf_summary(data, other_pdfs=None, max_pages=200):
+    """Short text description of a PDF for the AI."""
+
+    reader = _open_pdf(data)
+
+    total = len(reader.pages)
+
+    lines = [f"PDF with {total} page(s)."]
+
+    for i in range(min(total, max_pages)):
+
+        try:
+            text = " ".join((reader.pages[i].extract_text() or "").split())
+        except Exception:
+            text = ""
+
+        lines.append(f"Page {i + 1}: {text[:120] or '(no text, maybe a scan)'}")
+
+    if total > max_pages:
+        lines.append(f"... {total - max_pages} more page(s) not shown")
+
+    if other_pdfs:
+
+        lines.append(
+            "Other PDF files in this project that can be appended: "
+            + "; ".join(other_pdfs[:30])
+        )
+
+    return "\n".join(lines)[:AI_MAX_CHARS]
+
+
+def _overlay_page(width, height, text, style, position):
+    """A one-page PDF with a watermark or a stamp, to merge over a page."""
+
+    from pypdf import PdfReader
+    from reportlab.pdfgen import canvas
+
+    buffer = io.BytesIO()
+
+    c = canvas.Canvas(buffer, pagesize=(width, height))
+
+    c.saveState()
+
+    if style == "watermark":
+
+        diagonal = (width ** 2 + height ** 2) ** 0.5
+
+        size = max(12, min(120, diagonal * 0.7 / (0.62 * max(len(text), 1))))
+
+        c.setFont("Helvetica-Bold", size)
+
+        c.setFillColorRGB(0.6, 0.6, 0.6)
+
+        try:
+            c.setFillAlpha(0.35)
+        except Exception:
+            pass
+
+        c.translate(width / 2, height / 2)
+
+        c.rotate(45)
+
+        c.drawCentredString(0, -size / 3, text)
+
+    else:
+
+        size = 14
+
+        c.setFont("Helvetica-Bold", size)
+
+        c.setFillColorRGB(0.8, 0.1, 0.1)
+
+        margin = 24
+
+        text_width = c.stringWidth(text, "Helvetica-Bold", size)
+
+        position = str(position or "top-right").lower()
+
+        if position.endswith("left"):
+            x = margin
+        elif position.endswith("center"):
+            x = (width - text_width) / 2
+        else:
+            x = width - margin - text_width
+
+        y = height - margin - size if position.startswith("top") else margin
+
+        c.drawString(x, y, text)
+
+    c.restoreState()
+
+    c.save()
+
+    buffer.seek(0)
+
+    return PdfReader(buffer).pages[0]
+
+
+def _apply_pdf_op(pages, op, get_file):
+    """Apply one operation to the list of pages. Returns (pages, text)."""
+
+    kind = op.get("op")
+
+    total = len(pages)
+
+    if kind == "delete_pages":
+
+        if not op.get("pages"):
+            raise ValueError("no pages given")
+
+        drop = set(_pages_from(op.get("pages"), total))
+
+        if len(drop) >= total:
+            raise ValueError("this would remove every page")
+
+        kept = [p for i, p in enumerate(pages, start=1) if i not in drop]
+
+        return kept, f"Deleted {len(drop)} page(s), {len(kept)} left"
+
+    if kind == "keep_pages":
+
+        if not op.get("pages"):
+            raise ValueError("no pages given")
+
+        wanted = list(dict.fromkeys(_pages_from(op.get("pages"), total)))
+
+        return [pages[i - 1] for i in wanted], f"Kept {len(wanted)} page(s)"
+
+    if kind == "reorder_pages":
+
+        order = list(dict.fromkeys(_pages_from(op.get("order"), total)))
+
+        if sorted(order) != list(range(1, total + 1)):
+            raise ValueError("the order must list every page exactly once")
+
+        return [pages[i - 1] for i in order], "Reordered the pages"
+
+    if kind == "rotate_pages":
+
+        degrees = int(op.get("degrees", 90))
+
+        if degrees % 90:
+            raise ValueError("degrees must be 90, 180 or 270")
+
+        selected = sorted(set(_pages_from(op.get("pages"), total)))
+
+        for i in selected:
+            pages[i - 1].rotate(degrees)
+
+        return pages, f"Rotated {len(selected)} page(s) by {degrees} degrees"
+
+    if kind in ("add_watermark", "add_stamp"):
+
+        text = str(op.get("text", "")).strip()
+
+        if not text:
+            raise ValueError("no text given")
+
+        try:
+            text.encode("latin-1")
+        except UnicodeEncodeError:
+            raise ValueError("stamps support English letters and numbers only")
+
+        style = "watermark" if kind == "add_watermark" else "stamp"
+
+        selected = sorted(set(_pages_from(op.get("pages"), total)))
+
+        for i in selected:
+
+            page = pages[i - 1]
+
+            overlay = _overlay_page(
+                float(page.mediabox.width),
+                float(page.mediabox.height),
+                text,
+                style,
+                op.get("position")
+            )
+
+            page.merge_page(overlay)
+
+        return pages, f"Added {style} '{text}' on {len(selected)} page(s)"
+
+    if kind == "append_pdf":
+
+        name = op.get("file")
+
+        other_data = get_file(name) if (get_file and name) else None
+
+        if not other_data:
+            raise ValueError(f"the file '{name}' was not found in this project")
+
+        extra = list(_open_pdf(other_data).pages)
+
+        if str(op.get("position", "end")).lower() == "start":
+            return extra + pages, f"Added {len(extra)} page(s) from '{name}' at the start"
+
+        return pages + extra, f"Added {len(extra)} page(s) from '{name}' at the end"
+
+    raise ValueError(f"unknown operation '{kind}'")
+
+
+def apply_pdf_plan(data, operations, get_file=None):
+    """Apply operations to a COPY of the PDF.
+    Returns (new_file_bytes, log) where log is a list of (ok, text)."""
+
+    from pypdf import PdfWriter
+
+    pages = list(_open_pdf(data).pages)
+
+    log = []
+
+    for n, op in enumerate(operations[:40], start=1):
+
+        try:
+
+            pages, text = _apply_pdf_op(pages, op, get_file)
+
+            log.append((True, f"{n}. {text}"))
+
+        except Exception as e:
+
+            log.append((False, f"{n}. {describe_op(op)} -> skipped: {e}"))
+
+    if not pages:
+        raise ValueError("the result would have no pages")
+
+    writer = PdfWriter()
+
+    for page in pages:
+        writer.add_page(page)
+
+    out = io.BytesIO()
+
+    writer.write(out)
+
+    return out.getvalue(), log
+
+
+# =========================================================
+# ONE ENTRY POINT FOR ALL FILE TYPES
+# =========================================================
+
+EDITABLE_TYPES = {".xlsx": "excel", ".pdf": "pdf"}
+
+
+def file_kind(name):
+    """'excel', 'pdf' or None (not editable)."""
+
+    return EDITABLE_TYPES.get(os.path.splitext(str(name).lower())[1])
+
+
+def build_summary(kind, data, other_pdfs=None):
+
+    if kind == "pdf":
+        return pdf_summary(data, other_pdfs)
+
+    return workbook_summary(data)
+
+
+def system_for(kind):
+
+    return PDF_SYSTEM_PROMPT if kind == "pdf" else EDIT_SYSTEM_PROMPT
+
+
+def apply_plan_for(kind, data, operations, get_file=None):
+
+    if kind == "pdf":
+        return apply_pdf_plan(data, operations, get_file)
+
+    return apply_edit_plan(data, operations)
 
 
 # ===== UI =====
@@ -2317,7 +2452,7 @@ is_admin = auth["role"] == "admin"
 
 
 # =========================================================
-# DOCUMENTS TABLE WITH DELETE (red X on every row)
+# FILE ACTIONS (delete confirmation, open folder, send to AI)
 # =========================================================
 
 @st.dialog("Delete file")
@@ -2325,7 +2460,7 @@ def confirm_delete_dialog(doc_id, file_name, project, storage_path):
 
     st.write(
         f"Are you sure you want to delete **{md_safe(file_name)}** "
-        f"(project {md_safe(project)})?"
+        f"(folder {md_safe(project)})?"
     )
 
     st.caption("This cannot be undone.")
@@ -2349,51 +2484,109 @@ def confirm_delete_dialog(doc_id, file_name, project, storage_path):
         st.rerun()
 
 
-DOCS_CSS = """
-<style>
-.st-key-docs_table p { font-size: 14px; margin-bottom: 0; }
+def open_folder(number):
 
-.st-key-docs_table [class*="st-key-del_doc_"] button {
-    min-height: 26px;
-    height: 26px;
-    width: 26px;
-    min-width: 26px;
-    padding: 0;
-    border: none;
-    background: transparent;
-    box-shadow: none;
-    border-radius: 6px;
+    st.session_state.docs_folder = number
+
+
+def goto_ai(doc):
+    """Called when ✨ is pressed on a file: open the AI page with that file."""
+
+    st.session_state.ai_target = {
+        "name": doc[2],
+        "path": doc[7],
+        "project": doc[1]
+    }
+
+    st.session_state.pop("ai_last", None)
+
+    st.session_state.menu = "🪄 AI"
+
+
+# =========================================================
+# DOCUMENTS: FOLDERS AND FILES (like a file explorer)
+# =========================================================
+
+EXPLORER_CSS = """
+<style>
+.st-key-docs_root [class*="st-key-folder_"] button {
+    justify-content: flex-start;
+    text-align: left;
+    height: auto;
+    min-height: 56px;
+    padding: 12px 14px;
+    border-radius: 10px;
+    border: 1px solid rgba(128, 128, 128, 0.25);
+    background: rgba(128, 128, 128, 0.06);
+}
+
+.st-key-docs_root [class*="st-key-folder_"] button:hover {
+    border-color: #f5b301;
+    background: rgba(245, 179, 1, 0.12);
+}
+
+.st-key-docs_root [class*="st-key-folder_"] button p {
+    font-size: 15px;
+    font-weight: 600;
+    text-align: left;
+}
+
+.st-key-docs_files p { font-size: 14px; margin-bottom: 0; }
+
+.st-key-docs_files [class*="st-key-del_doc_"] button,
+.st-key-docs_files [class*="st-key-ai_doc_"] button {
+    min-height: 34px;
+    height: 34px;
+    min-width: 34px;
+    padding: 0 8px;
+    border-radius: 8px;
+}
+
+.st-key-docs_files [class*="st-key-del_doc_"] button {
     color: #c62828;
 }
 
-.st-key-docs_table [class*="st-key-del_doc_"] button p {
-    font-size: 15px;
-    line-height: 1;
-}
-
-.st-key-docs_table [class*="st-key-del_doc_"] button:hover {
+.st-key-docs_files [class*="st-key-del_doc_"] button:hover {
     background: rgba(198, 40, 40, 0.12);
-    color: #b71c1c;
+    border-color: #c62828;
 }
 </style>
 """
 
 
-def show_documents_table(documents, can_delete):
+def file_icon(name):
 
-    st.markdown(DOCS_CSS, unsafe_allow_html=True)
+    ext = os.path.splitext(str(name).lower())[1]
 
-    widths = [1, 5, 1, 1.3, 2, 2]
+    if ext in (".xlsx", ".xls", ".xlsm", ".csv"):
+        return "📊"
 
-    labels = [
-        "Project", "File Name", "Type", "Size", "Notes", "Uploaded At"
+    if ext == ".pdf":
+        return "📕"
+
+    if ext in (".dwg", ".dxf"):
+        return "📐"
+
+    if ext in (".doc", ".docx", ".txt", ".md"):
+        return "📝"
+
+    if ext in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
+        return "🖼️"
+
+    if ext in (".zip", ".rar", ".7z"):
+        return "📦"
+
+    return "📄"
+
+
+def show_files_list(docs, show_folder):
+    """Rows of files: icon + name, type, size, date and action buttons."""
+
+    widths = ([1.1] if show_folder else []) + [5, 1, 1.2, 2, 2.4]
+
+    labels = (["Folder"] if show_folder else []) + [
+        "Name", "Type", "Size", "Modified", ""
     ]
-
-    if can_delete:
-
-        widths.append(0.6)
-
-        labels.append("")
 
     head_style = (
         "font-size:12px;font-weight:600;text-transform:uppercase;"
@@ -2402,7 +2595,9 @@ def show_documents_table(documents, can_delete):
 
     line = "<hr style='margin:2px 0;opacity:0.15'>"
 
-    with st.container(key="docs_table"):
+    urls = signed_urls([(d[7], d[2]) for d in docs])
+
+    with st.container(key="docs_files"):
 
         header = st.columns(widths, vertical_alignment="center")
 
@@ -2420,20 +2615,43 @@ def show_documents_table(documents, can_delete):
             unsafe_allow_html=True
         )
 
-        for d in documents:
+        for d in docs:
 
             cols = st.columns(widths, vertical_alignment="center")
 
-            cols[0].markdown(md_safe(d[1]))
-            cols[1].markdown(md_safe(d[2]))
-            cols[2].markdown(md_safe(d[3]))
-            cols[3].markdown(md_safe(format_size(d[4])))
-            cols[4].markdown(md_safe(d[5]))
-            cols[5].markdown(md_safe(d[6]))
+            i = 0
 
-            if can_delete:
+            if show_folder:
 
-                if cols[6].button(
+                cols[0].markdown(md_safe(d[1]))
+
+                i = 1
+
+            cols[i].markdown(f"{file_icon(d[2])} {md_safe(d[2])}")
+            cols[i + 1].markdown(md_safe(d[3] or ""))
+            cols[i + 2].markdown(md_safe(format_size(d[4])))
+            cols[i + 3].markdown(md_safe(d[6]))
+
+            actions = cols[i + 4].columns(3)
+
+            url = urls.get(d[7])
+
+            if url:
+                actions[0].link_button("⬇", url, help="Download")
+
+            if is_admin and file_kind(d[2]):
+
+                actions[1].button(
+                    "✨",
+                    key=f"ai_doc_{d[0]}",
+                    help="Edit with AI",
+                    on_click=goto_ai,
+                    args=(d,)
+                )
+
+            if is_admin:
+
+                if actions[2].button(
                     "✕",
                     key=f"del_doc_{d[0]}",
                     help="Delete this file"
@@ -2444,175 +2662,276 @@ def show_documents_table(documents, can_delete):
             st.markdown(line, unsafe_allow_html=True)
 
 
+def show_root_view(projects, all_docs):
+
+    query = st.text_input(
+        "Search",
+        placeholder="🔍 Search folders and files...",
+        key="docs_search",
+        label_visibility="collapsed"
+    )
+
+    q = query.strip().lower()
+
+    counts = {}
+
+    for d in all_docs:
+        counts[d[1]] = counts.get(d[1], 0) + 1
+
+    folders = [
+        p for p in projects
+        if not q
+        or q in p[0].lower()
+        or q in p[1].lower()
+        or q in (p[2] or "").lower()
+    ]
+
+    with st.container(key="docs_root"):
+
+        st.markdown(f"**Folders** · {len(folders)}")
+
+        per_row = 3
+
+        for i in range(0, len(folders), per_row):
+
+            row = st.columns(per_row)
+
+            for col, p in zip(row, folders[i:i + per_row]):
+
+                with col:
+
+                    st.button(
+                        f"📁 {p[0]} — {p[1]}",
+                        key=f"folder_{p[0]}",
+                        use_container_width=True,
+                        on_click=open_folder,
+                        args=(p[0],)
+                    )
+
+                    st.caption(
+                        f"{p[2] or '—'} · {counts.get(p[0], 0)} file(s)"
+                    )
+
+        if not folders:
+            st.info("No folder matches your search.")
+
+    if q:
+
+        files = [d for d in all_docs if q in str(d[2]).lower()][:100]
+
+        if files:
+
+            st.markdown(f"**Files** · {len(files)}")
+
+            show_files_list(files, show_folder=True)
+
+
+def show_folder_view(project, docs):
+
+    st.button(
+        "← All folders",
+        key="docs_back",
+        on_click=open_folder,
+        args=(None,)
+    )
+
+    st.markdown(f"### 📁 {md_safe(project[0])} — {md_safe(project[1])}")
+
+    status = "🟢 Active" if project[3] == "Active" else "🔴 Closed"
+
+    st.caption(
+        f"{project[2] or '—'} · {status} · {len(docs)} file(s)"
+    )
+
+    if not docs:
+
+        st.info("This folder is empty.")
+
+        return
+
+    show_files_list(docs, show_folder=False)
+
+
+def show_explorer():
+
+    st.markdown(EXPLORER_CSS, unsafe_allow_html=True)
+
+    projects = get_projects()
+
+    if not projects:
+
+        st.info("No folders yet. Add a project first.")
+
+        return
+
+    by_number = {p[0]: p for p in projects}
+
+    all_docs = get_documents()
+
+    folder = st.session_state.get("docs_folder")
+
+    if folder and folder not in by_number:
+
+        folder = None
+
+        st.session_state.docs_folder = None
+
+    if folder:
+
+        show_folder_view(
+            by_number[folder],
+            [d for d in all_docs if d[1] == folder]
+        )
+
+    else:
+
+        show_root_view(projects, all_docs)
+
+
 # =========================================================
-# EXCEL EDITOR (AI page, admin only)
+# AI PAGE: write a request, get the new file
 # =========================================================
 
 XLSX_MIME = (
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
 
+KIND_INFO = {
+    "excel": ("XLSX", XLSX_MIME),
+    "pdf": ("PDF", "application/pdf")
+}
 
-def show_excel_editor(project_number, docs):
 
-    xlsx_docs = [d for d in docs if str(d[2]).lower().endswith(".xlsx")]
+def run_ai_request(name, data, request, project=None, project_docs=None):
+    """Let the AI plan the work, then do it on a copy of the file.
+    Returns a dict with either 'error' or the plan, the log and the bytes."""
 
-    if not xlsx_docs:
+    kind = file_kind(name)
+
+    if kind is None:
+
+        return {
+            "error": "The AI can edit Excel (.xlsx) and PDF files. "
+                     "Other types are not supported yet."
+        }
+
+    paths = {}
+
+    other_pdfs = []
+
+    for d in (project_docs or []):
+
+        paths.setdefault(d[2], d[7])
+
+        if file_kind(d[2]) == "pdf" and d[2] != name and d[2] not in other_pdfs:
+            other_pdfs.append(d[2])
+
+    try:
+        summary = build_summary(kind, data, other_pdfs)
+    except Exception as e:
+        return {"error": f"Could not read the file: {e}"}
+
+    plan, error = ask_ai_plan(summary, request, system_for(kind))
+
+    if error:
+        return {"error": error}
+
+    if not plan["operations"]:
+
+        return {"plan": plan, "log": [], "bytes": None, "kind": kind}
+
+    def get_file(other_name):
+
+        path = paths.get(other_name)
+
+        return download_bytes(path) if path else None
+
+    try:
+        new_bytes, log = apply_plan_for(kind, data, plan["operations"], get_file)
+    except Exception as e:
+        return {"error": f"Could not create the file: {e}"}
+
+    return {
+        "plan": plan,
+        "log": log,
+        "bytes": new_bytes,
+        "name": edited_name(name, kind),
+        "kind": kind
+    }
+
+
+def history_text(plan, log):
+
+    lines = [plan["summary"], ""]
+
+    lines += [("✅ " if ok else "⚠️ ") + text for ok, text in log]
+
+    lines += ["", f"*Done by {plan.get('provider', 'AI')}*"]
+
+    return "\n\n".join(lines)
+
+
+def show_ai_result(result, project):
+
+    if result.get("error"):
+
+        st.error(result["error"])
+
+        return
+
+    plan = result["plan"]
+
+    if plan["summary"]:
+        st.write(plan["summary"])
+
+    if plan.get("provider"):
+        st.caption(f"Done by {plan['provider']}")
+
+    for warning in plan["warnings"]:
+        st.caption(f"⚠️ {warning}")
+
+    if result["bytes"] is None:
 
         st.info(
-            "No .xlsx files in this project yet. "
-            "Only .xlsx files can be edited."
+            "The AI found nothing it can change with this request. "
+            "Try describing it differently."
         )
 
         return
 
-    options = {f"{d[2]} | {d[6]}": d for d in xlsx_docs}
+    for ok, text in result["log"]:
+        st.write(("✅ " if ok else "⚠️ ") + text)
 
-    choice = st.selectbox(
-        "Excel file",
-        list(options.keys()),
-        key="edit_file"
+    if not any(ok for ok, _ in result["log"]):
+
+        st.warning("None of the changes could be applied.")
+
+        return
+
+    label, mime = KIND_INFO[result["kind"]]
+
+    st.download_button(
+        f"⬇️ Download {result['name']}",
+        data=result["bytes"],
+        file_name=result["name"],
+        mime=mime,
+        type="primary",
+        use_container_width=True
     )
 
-    doc = options[choice]
-
-    st.warning(
-        "The original file is never changed: you get an edited COPY. "
-        "Charts, images, pivot tables and macros inside the file "
-        "are not kept in the copy."
-    )
-
-    instruction = st.text_area(
-        "What should be changed?",
-        placeholder=(
-            "Example: delete column D, and copy all contract numbers "
-            "to a new sheet (unique values)"
-        ),
-        height=100,
-        key="edit_instruction"
-    )
-
-    if st.button("🧠 Plan the edit", key="edit_plan_button"):
-
-        if not instruction.strip():
-
-            st.error("Please write what you want to change.")
-
-        else:
-
-            error = None
-
-            with st.spinner("The AI is reading the file and planning..."):
-
-                data = download_bytes(doc[7])
-
-                if data is None:
-
-                    error = "Could not read the file."
-
-                else:
-
-                    try:
-                        summary = workbook_summary(data)
-                    except Exception as e:
-                        summary = None
-                        error = f"Could not read the Excel file: {e}"
-
-                if error is None:
-                    plan, error = ask_ai_plan(summary, instruction.strip())
-
-            if error:
-
-                st.error(error)
-
-            else:
-
-                st.session_state.edit_plan = {"doc_id": doc[0], "plan": plan}
-
-                st.session_state.pop("edit_result", None)
-
-    state = st.session_state.get("edit_plan")
-
-    if state and state["doc_id"] == doc[0]:
-
-        plan = state["plan"]
-
-        st.subheader("The plan")
-
-        if plan["summary"]:
-            st.write(plan["summary"])
-
-        if plan.get("provider"):
-            st.caption(f"Plan made by {plan['provider']}")
-
-        for warning in plan["warnings"]:
-            st.caption(f"⚠️ {warning}")
-
-        operations = plan["operations"]
-
-        if not operations:
-
-            st.info("The AI found nothing it can change with this request.")
-
-        else:
-
-            for i, op in enumerate(operations, start=1):
-                st.markdown(f"{i}. {md_safe(describe_op(op))}")
-
-            if st.button(
-                "✅ Apply and create the file",
-                key="edit_apply_button",
-                use_container_width=True
-            ):
-
-                with st.spinner("Editing the file..."):
-
-                    data = download_bytes(doc[7])
-
-                    if data is None:
-
-                        st.error("Could not read the file.")
-
-                    else:
-
-                        new_bytes, log = apply_edit_plan(data, operations)
-
-                        st.session_state.edit_result = {
-                            "doc_id": doc[0],
-                            "bytes": new_bytes,
-                            "name": edited_name(doc[2]),
-                            "log": log
-                        }
-
-    result = st.session_state.get("edit_result")
-
-    if result and result["doc_id"] == doc[0]:
-
-        st.subheader("Result")
-
-        for ok, text in result["log"]:
-
-            st.write(("✅ " if ok else "⚠️ ") + text)
-
-        st.download_button(
-            "⬇️ Download the edited file",
-            data=result["bytes"],
-            file_name=result["name"],
-            mime=XLSX_MIME,
-            use_container_width=True
-        )
+    if project:
 
         if st.button(
-            "💾 Also save the edited file in this project",
-            key="edit_save_button",
+            f"💾 Also save a copy in folder {project}",
+            key="ai_save_copy",
             use_container_width=True
         ):
 
-            project_id = get_project_id(project_number)
+            project_id = get_project_id(project)
 
             if project_id is None:
 
-                st.error("Project not found.")
+                st.error("Folder not found.")
 
             else:
 
@@ -2620,7 +2939,7 @@ def show_excel_editor(project_number, docs):
                     project_id,
                     result["name"],
                     result["bytes"],
-                    XLSX_MIME
+                    mime
                 )
 
                 if error:
@@ -2630,19 +2949,169 @@ def show_excel_editor(project_number, docs):
                 else:
 
                     ok, message = add_document(
-                        project_number,
+                        project,
                         result["name"],
                         path,
-                        "XLSX",
+                        label,
                         len(result["bytes"]),
-                        f"AI-edited copy of {doc[2]}"
+                        ""
                     )
 
                     if ok:
-                        st.success("Saved. It now appears in Documents.")
+
+                        st.success("Saved. It now appears in the folder.")
+
                     else:
+
                         delete_storage([path])
+
                         st.error(message)
+
+
+def show_ai_request():
+
+    if not ai_providers():
+
+        st.warning(
+            "No AI key found. Add GEMINI_API_KEY (free), "
+            "OPENROUTER_API_KEY (free models) or ANTHROPIC_API_KEY "
+            "in the app Secrets."
+        )
+
+        return
+
+    target = st.session_state.get("ai_target")
+
+    upload = None
+
+    if target:
+
+        left, right = st.columns([8, 1], vertical_alignment="center")
+
+        left.markdown(
+            f"📎 **{md_safe(target['name'])}** · folder "
+            f"{md_safe(target['project'])}"
+        )
+
+        if right.button("✕", key="ai_clear_target", help="Remove this file"):
+
+            st.session_state.pop("ai_target", None)
+
+            st.session_state.pop("ai_last", None)
+
+            st.rerun()
+
+        name = target["name"]
+
+    else:
+
+        upload = st.file_uploader(
+            "Drop an Excel or PDF file here",
+            type=["xlsx", "pdf"],
+            key="ai_upload"
+        )
+
+        st.caption(
+            "Or open a folder in Documents and press ✨ next to a file."
+        )
+
+        name = upload.name if upload else None
+
+    request = st.text_area(
+        "What do you want done?",
+        placeholder=(
+            "Examples: delete column D and copy all contract numbers to a "
+            "new sheet  |  delete pages 2-3 and stamp IFC on every page"
+        ),
+        height=110,
+        key="ai_request"
+    )
+
+    if st.button(
+        "✨ Do it",
+        key="ai_run",
+        type="primary",
+        use_container_width=True
+    ):
+
+        if not name:
+
+            st.error("Add a file first.")
+
+        elif not request.strip():
+
+            st.error("Write what you want done.")
+
+        else:
+
+            with st.spinner("Working on it..."):
+
+                if target:
+                    data = download_bytes(target["path"])
+                else:
+                    data = upload.getvalue()
+
+                if data is None:
+
+                    result = {"error": "Could not read the file."}
+
+                else:
+
+                    project = target["project"] if target else None
+
+                    result = run_ai_request(
+                        name,
+                        data,
+                        request.strip(),
+                        project,
+                        get_documents(project) if project else []
+                    )
+
+                    result["project"] = project
+
+                    if (
+                        project
+                        and not result.get("error")
+                        and result.get("bytes") is not None
+                    ):
+
+                        save_ai_result(
+                            project,
+                            name,
+                            request.strip(),
+                            history_text(result["plan"], result["log"])
+                        )
+
+                st.session_state.ai_last = result
+
+    last = st.session_state.get("ai_last")
+
+    if last:
+
+        st.divider()
+
+        show_ai_result(last, last.get("project"))
+
+
+def show_ai_history():
+
+    st.subheader("History")
+
+    rows = get_recent_ai_results(30)
+
+    if not rows:
+
+        st.info("No requests yet.")
+
+        return
+
+    for i, r in enumerate(rows):
+
+        with st.expander(f"{r[1]} — {r[4]}", expanded=False):
+
+            st.caption(f"Folder {r[0]} · Request: {r[2]}")
+
+            st.markdown(r[3])
 
 
 # =========================================================
@@ -2666,7 +3135,7 @@ if is_admin:
 
 menu += ["📊 Reports", "🪄 AI"]
 
-page = st.sidebar.radio("Menu", menu)
+page = st.sidebar.radio("Menu", menu, key="menu")
 
 st.sidebar.divider()
 
@@ -3032,71 +3501,7 @@ elif page == "📄 Documents":
         else:
             st.error(doc_text)
 
-    projects = get_projects()
-
-    if not projects:
-
-        st.info("No projects yet.")
-
-    else:
-
-        options = {"All Projects": None}
-
-        for p in projects:
-            options[f"{p[0]} — {p[1]}"] = p[0]
-
-        col1, col2 = st.columns([2, 2])
-
-        choice = col1.selectbox("Project", list(options.keys()))
-
-        search_file = col2.text_input(
-            "🔍 Search File Name",
-            placeholder="Type part of the file name..."
-        )
-
-        documents = get_documents(options[choice])
-
-        if search_file:
-
-            documents = [
-                d for d in documents
-                if search_file.lower() in d[2].lower()
-            ]
-
-        if documents:
-
-            show_documents_table(documents, is_admin)
-
-            st.divider()
-
-            st.subheader("⬇️ Download a File")
-
-            file_options = {
-                f"{d[1]} | {d[2]} | {d[6]}": d for d in documents
-            }
-
-            selected = st.selectbox(
-                "Select file",
-                list(file_options.keys())
-            )
-
-            doc = file_options[selected]
-
-            url = signed_url(doc[7], doc[2])
-
-            if url:
-
-                st.link_button("⬇️ Download", url)
-
-                st.caption("The download link works for one hour.")
-
-            else:
-
-                st.error("Could not create a download link for this file.")
-
-        else:
-
-            st.info("No documents found.")
+    show_explorer()
 
 
 # =========================================================
@@ -3139,25 +3544,6 @@ elif page == "📤 Upload" and is_admin:
             key=f"uploader_{key}"
         )
 
-        notes = st.text_input("Notes (optional)", key=f"notes_{key}")
-
-        send_ai = st.checkbox(
-            "🪄 Send to AI after saving",
-            value=False,
-            key=f"send_ai_{key}"
-        )
-
-        ai_instruction = AI_DEFAULT_INSTRUCTION
-
-        if send_ai:
-
-            ai_instruction = st.text_area(
-                "What should AI do with the file?",
-                value=AI_DEFAULT_INSTRUCTION,
-                height=100,
-                key=f"ai_instr_{key}"
-            )
-
         if st.button("💾 Save to Project", use_container_width=True):
 
             if not files:
@@ -3173,8 +3559,6 @@ elif page == "📤 Upload" and is_admin:
                     st.error("Project not found.")
 
                 else:
-
-                    ai_outputs = []
 
                     problems = []
 
@@ -3208,7 +3592,7 @@ elif page == "📤 Upload" and is_admin:
                             path,
                             ext or "FILE",
                             len(data),
-                            notes.strip()
+                            ""
                         )
 
                         if not ok:
@@ -3220,31 +3604,6 @@ elif page == "📤 Upload" and is_admin:
                             continue
 
                         saved += 1
-
-                        if send_ai:
-
-                            with st.spinner(
-                                f"🪄 AI is analyzing {f.name} ..."
-                            ):
-
-                                ai_ok, result = analyze_file(
-                                    f.name,
-                                    data,
-                                    ai_instruction
-                                )
-
-                            if ai_ok:
-
-                                save_ai_result(
-                                    project_number,
-                                    f.name,
-                                    ai_instruction,
-                                    result
-                                )
-
-                            ai_outputs.append((f.name, ai_ok, result))
-
-                    st.session_state.ai_outputs = ai_outputs
 
                     st.session_state.upload_problems = problems
 
@@ -3264,17 +3623,6 @@ elif page == "📤 Upload" and is_admin:
         for problem in st.session_state.pop("upload_problems", []):
             st.error(problem)
 
-        for name, ok, text in st.session_state.pop("ai_outputs", []):
-
-            if ok:
-
-                with st.expander(f"🪄 AI result — {name}", expanded=True):
-                    st.markdown(text)
-
-            else:
-
-                st.error(f"🪄 AI could not analyze {name}: {text}")
-
         st.divider()
 
         st.subheader("Files in this project")
@@ -3289,7 +3637,6 @@ elif page == "📤 Upload" and is_admin:
                         "File Name": d[2],
                         "Type": d[3],
                         "Size": format_size(d[4]),
-                        "Notes": d[5],
                         "Uploaded At": d[6]
                     }
                     for d in documents
@@ -3341,186 +3688,17 @@ elif page == "🪄 AI":
     if is_admin:
 
         st.write(
-            "Analyze project files with AI. "
-            "Every result is saved and visible to all users."
+            "Tell the AI what you want done with an Excel or PDF file. "
+            "It prepares the new file and you download it. "
+            "The original file is never changed."
         )
+
+        show_ai_request()
 
     else:
 
-        st.write("AI results saved for each project (read only).")
+        st.info("Only the Admin can send requests to the AI.")
 
-    projects = get_projects()
+    st.divider()
 
-    if not projects:
-
-        st.info("No projects yet.")
-
-    else:
-
-        ai_options = {f"{p[0]} — {p[1]}": p[0] for p in projects}
-
-        ai_choice = st.selectbox(
-            "Project",
-            list(ai_options.keys()),
-            key="ai_report_project"
-        )
-
-        ai_project = ai_options[ai_choice]
-
-        if is_admin:
-
-            ai_mode = st.radio(
-                "What do you want?",
-                [
-                    "📝 Analyze a file (text answer)",
-                    "✏️ Edit an Excel file (get a new file)"
-                ],
-                horizontal=True,
-                key="ai_mode"
-            )
-
-            ai_docs = get_documents(ai_project)
-
-            if ai_mode.startswith("✏️"):
-
-                show_excel_editor(ai_project, ai_docs)
-
-            elif ai_docs:
-
-                ai_file_options = {
-                    f"{d[2]} | {d[6]}": d for d in ai_docs
-                }
-
-                ai_file = st.selectbox(
-                    "File",
-                    list(ai_file_options.keys()),
-                    key="ai_report_file"
-                )
-
-                ai_prompt = st.text_area(
-                    "What should AI do with the file?",
-                    value=AI_DEFAULT_INSTRUCTION,
-                    height=100,
-                    key="ai_report_prompt"
-                )
-
-                provider_choices = ai_provider_choices()
-
-                if not provider_choices:
-
-                    st.warning(
-                        "No AI key found. Add GEMINI_API_KEY (free), "
-                        "OPENROUTER_API_KEY (free models) or "
-                        "ANTHROPIC_API_KEY in the app Secrets."
-                    )
-
-                else:
-
-                    which_label = st.selectbox(
-                        "Which AI?",
-                        list(provider_choices.keys()),
-                        key="ai_report_provider"
-                    )
-
-                    which = provider_choices[which_label]
-
-                    if st.button("🪄 Run AI", key="ai_report_run"):
-
-                        chosen = ai_file_options[ai_file]
-
-                        with st.spinner("🪄 AI is analyzing..."):
-
-                            file_data = download_bytes(chosen[7])
-
-                            if file_data is None:
-
-                                st.error("Could not read the file.")
-
-                            elif which == "compare":
-
-                                answers, problem = compare_ai(
-                                    chosen[2],
-                                    file_data,
-                                    ai_prompt
-                                )
-
-                                if problem:
-
-                                    st.error(problem)
-
-                                else:
-
-                                    saved = 0
-
-                                    for label, ok, text in answers:
-
-                                        with st.expander(label, expanded=True):
-
-                                            if ok:
-                                                st.markdown(text)
-                                            else:
-                                                st.error(text)
-
-                                        if ok:
-
-                                            save_ai_result(
-                                                ai_project,
-                                                chosen[2],
-                                                ai_prompt,
-                                                with_footer(text, label)
-                                            )
-
-                                            saved += 1
-
-                                    st.success(
-                                        f"{saved} answer(s) saved below."
-                                    )
-
-                            else:
-
-                                ok, text, used = run_ai(
-                                    chosen[2],
-                                    file_data,
-                                    ai_prompt,
-                                    which
-                                )
-
-                                if ok:
-
-                                    save_ai_result(
-                                        ai_project,
-                                        chosen[2],
-                                        ai_prompt,
-                                        with_footer(text, used)
-                                    )
-
-                                    st.success(
-                                        f"Done ({used}). "
-                                        "The result is saved below."
-                                    )
-
-                                else:
-
-                                    st.error(text)
-
-            else:
-
-                st.info("No files in this project yet. Upload files first.")
-
-        st.subheader("Previous AI results")
-
-        ai_results = get_ai_results(ai_project)
-
-        if ai_results:
-
-            for i, r in enumerate(ai_results):
-
-                with st.expander(f"{r[0]} — {r[3]}", expanded=(i == 0)):
-
-                    st.caption(f"Request: {r[1]}")
-
-                    st.markdown(r[2])
-
-        else:
-
-            st.info("No AI results for this project yet.")
+    show_ai_history()
